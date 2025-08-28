@@ -1,5 +1,3 @@
-% multimodel.m
-% 多模型 NSGA-II 超参数优化与训练（包含最终训练展示和增强可视化）
 clc; clear; close all;
 warning off
 
@@ -12,10 +10,6 @@ if ~license('test', 'neural_network_toolbox')
     error('未检测到 Deep Learning Toolbox。请确保已安装该工具箱。');
 end
 fprintf('MATLAB 版本：%s\n', matlabVersion);
-
-% 全局开关：在 evaluateModel 中控制是否打印详细调试信息（注意：在函数中需声明 global）
-global GLOBAL_VERBOSE;
-GLOBAL_VERBOSE = false;  % 若需要调试，将其设为 true
 
 %% 1. 数据读取与预处理
 fprintf('正在读取风速数据...\n');
@@ -90,916 +84,928 @@ YTest_actual = YTest * (maxSpeed - minSpeed) + minSpeed;
 fprintf('数据预处理完成。训练样本数：%d，验证样本数：%d，测试样本数：%d\n', ...
     numTrain, numVal, numTest);
 
-%% 2. 定义要优化的模型类型
-modelTypes = {'CNN-LSTM', 'CNN', 'LSTM', 'GRU', 'Transformer'};
-numModels = length(modelTypes);
+%% 2. 定义超参数优化目标函数（在本文件后面定义为局部函数）
+% 说明：在原来10个变量基础上，新增以下超参数：
+% 11 optimizerType (1=adam,2=sgdm,3=rmsprop)
+% 12 numConvLayers (1 or 2)
+% 13 convDropout (0.0 - 0.5)
+% 14 activationFunction (1=ReLU,2=LeakyReLU,3=Tanh,4=Sigmoid)
+% 其它原有参数保持不变
 
-% 为每个模型创建结果存储结构
-allResults = struct();
+%% 3. 手动实现 NSGA-II 超参数优化（保留原来框架，扩展变量）
+fprintf('开始 NSGA-II 超参数优化（扩展超参数：optimizer、convLayers、convDropout、activationFunction）...\n');
 
-%% 3. 对每个模型执行 NSGA-II 超参数优化
-for modelIdx = 1:numModels
-    modelType = modelTypes{modelIdx};
-    modelKey = matlab.lang.makeValidName(modelType); % 将名称转换为合法字段名（例如 'CNN-LSTM' -> 'CNN_LSTM'）
-    fprintf('\n===== 开始 %s 模型的 NSGA-II 超参数优化 =====\n', modelType);
+% 优化定义范围（14变量）优化% 变量顺序：
+% 1 BatchSize, 2 LearnRate, 3 PoolType, 4 NumFilters1, 5 FilterSize1,
+% 6 LSTMUnits1, 7 LSTMUnits2, 8 RegType, 9 DropoutProb1, 10 DropoutProb2,
+% 11 OptimizerType, 12 NumConvLayers, 13 ConvDropout，14 ActivationFunction
+lb = [32, 1e-6, 1, 16, 2, 32, 32, 1, 0.2, 0.2, 1, 1, 0.1, 1];  % 优化后的下界
+ub = [128, 1e-3, 2, 256, 5, 128, 128, 3, 0.4, 0.4, 3, 2, 0.3, 4];  % 优化后的上界
+intCon = [1,3,4,5,6,7,8,11,12,14];  % 整数参数索引（保持不变）
+
+
+% NSGA-II 参数（沿用原来设置）
+populationSize = 70;  % 种群大小（调试时可缩小）
+maxGenerations = 20;  % 进化代数
+crossoverFraction = 0.8;
+mutationRate = 0.1;
+
+% 初始化种群
+numVars = length(lb);
+population = initializePopulation(populationSize, lb, ub, intCon);
+
+% 记录历史（修改为结构化存储Pareto前沿）
+bestParamsHistory = zeros(maxGenerations, numVars);
+bestPerformanceHistory = zeros(maxGenerations, 1);
+bestComplexityHistory = zeros(maxGenerations, 1);
+allParetoFronts = cell(maxGenerations, 1);  % 存储每代的Pareto结构体
+
+% 新增：存储特定代数的详细数据
+specificGens = [1, 5, 10, 20]; % 要特别记录的代数
+specificGenData = containers.Map('KeyType', 'int32', 'ValueType', 'any');
+
+% 绘图准备
+figure('Position', [100, 100, 800, 600]);
+hold on;
+xlabel('模型复杂度（越小越好）');
+ylabel('预测误差 (RMSE, m/s)（越小越好）');
+title('每一代的 Pareto 前沿（扩展超参）');
+grid on;
+
+% 进化主循环
+for generation = 1:maxGenerations
+    fprintf('第 %d 代进化中...\n', generation);
     
-    % 根据模型类型获取超参数范围
-    [lb, ub, intCon, paramNames] = getModelHyperparameterRanges(modelType);
-    numVars = length(lb);  % 获取当前模型的超参数数量
+    % 评估种群
+    [performance, complexity, rmse, mae, mape, r] = evaluatePopulation(population, XTrain, YTrain, XVal, YVal, minSpeed, maxSpeed, sequenceLength, numFeatures);
     
-    % NSGA-II 参数
-    populationSize = 2;  % 种群大小
-    maxGenerations = 20;  % 进化代数
-    crossoverFraction = 0.8;
-    mutationRate = 0.1;
+    % 记录当前代最佳解
+    [minPerformance, minIdx] = min(performance);
+    bestParamsHistory(generation, :) = population(minIdx, :);
+    bestPerformanceHistory(generation) = minPerformance;
+    bestComplexityHistory(generation) = complexity(minIdx);
     
-    % 初始化种群 - 确保与当前模型的超参数数量匹配
-    population = initializePopulation(populationSize, lb, ub, intCon);
+    % 快速非支配排序
+    [fronts, rank] = fastNonDominatedSort(performance, complexity);
     
-    % 记录历史 - 使用细胞数组存储不同维度的参数历史
-    bestParamsHistory = cell(maxGenerations, 1);  % 关键修改：使用细胞数组
-    bestPerformanceHistory = zeros(maxGenerations, 1);
-    bestComplexityHistory = zeros(maxGenerations, 1);
-    allParetoFronts = cell(maxGenerations, 1);  % 存储每代的Pareto结构体
+    % 拥挤距离计算
+    distance = improvedCrowdingDistance(performance, complexity, fronts);
+    
+    % 记录并绘制当前代的 Pareto 前沿（使用修正的结构化函数）
+    paretoStruct = findParetoFront(population, performance, complexity);
+    allParetoFronts{generation} = paretoStruct;
     
     % 新增：存储特定代数的详细数据
-    specificGens = [1, 5, 10]; % 要特别记录的代数（可以根据需要调整）
-    specificGenData = containers.Map('KeyType', 'int32', 'ValueType', 'any');
-    
-    % 进化主循环
-    for generation = 1:maxGenerations
-        fprintf('第 %d 代进化中...\n', generation);
-        
-        % 评估种群
-        [performance, complexity, rmse, mae, mape, r] = evaluatePopulation(population, XTrain, YTrain, XVal, YVal, ...
-            minSpeed, maxSpeed, sequenceLength, numFeatures, modelType);
-        
-        % 记录当前代最佳解 - 使用细胞数组索引
-        [minPerformance, minIdx] = min(performance);
-        bestParamsHistory{generation} = population(minIdx, :);  % 关键修改：使用细胞数组存储
-        bestPerformanceHistory(generation) = minPerformance;
-        bestComplexityHistory(generation) = complexity(minIdx);
-        
-        % 快速非支配排序
-        [fronts, rank] = fastNonDominatedSort(performance, complexity);
-        
-        % 拥挤距离计算
-        distance = improvedCrowdingDistance(performance, complexity, fronts);
-        
-        % 记录并绘制当前代的 Pareto 前沿（存储结构）
-        paretoStruct = findParetoFront(population, performance, complexity);
-        allParetoFronts{generation} = paretoStruct;
-        
-        % 新增：存储特定代数的详细数据
-        if ismember(generation, specificGens)
-            genData = struct();
-            genData.population = population;
-            genData.performance = performance;
-            genData.complexity = complexity;
-            genData.paretoFront = paretoStruct;
-            genData.rmse = rmse;
-            genData.mae = mae;
-            genData.mape = mape;
-            genData.r = r;
-            specificGenData(generation) = genData;
-        end
-        
-        fprintf('第 %d 代 Pareto 解的数量: %d\n', generation, paretoStruct.numSolutions);
-        
-        % 选择
-        matingPool = tournamentSelection(population, rank, distance, crossoverFraction, populationSize);
-        
-        % 交叉和变异
-        offspring = crossoverAndMutation(matingPool, lb, ub, intCon, mutationRate);
-        
-        % 评估子代
-        [offspringPerformance, offspringComplexity, ~, ~, ~, ~] = evaluatePopulation(offspring, XTrain, YTrain, XVal, YVal, ...
-            minSpeed, maxSpeed, sequenceLength, numFeatures, modelType);
-        
-        % 合并种群
-        combinedPopulation = [population; offspring];
-        combinedPerformance = [performance; offspringPerformance];
-        combinedComplexity = [complexity; offspringComplexity];
-        
-        % 对合并种群进行快速非支配排序
-        [combinedFronts, combinedRank] = fastNonDominatedSort(combinedPerformance, combinedComplexity);
-        combinedDistance = improvedCrowdingDistance(combinedPerformance, combinedComplexity, combinedFronts);
-        
-        % 环境选择
-        [newPopulation, newPerformance, newComplexity] = environmentalSelection(...
-            combinedPopulation, combinedPerformance, combinedComplexity, combinedRank, combinedDistance, populationSize);
-        
-        % 更新种群
-        population = newPopulation;
-        performance = newPerformance;
-        complexity = newComplexity;
+    if ismember(generation, specificGens)
+        genData = struct();
+        genData.population = population;
+        genData.performance = performance;
+        genData.complexity = complexity;
+        genData.paretoFront = paretoStruct;  % 存储结构化Pareto前沿
+        genData.rmse = rmse;
+        genData.mae = mae;
+        genData.mape = mape;
+        genData.r = r;
+        specificGenData(generation) = genData;
     end
     
-    fprintf('%s 模型 NSGA-II 优化完成。\n', modelType);
+    % 绘制当前代Pareto前沿
+    if paretoStruct.numSolutions > 0
+        perf_vals = paretoStruct.performance;
+        complexity_vals = paretoStruct.complexity;
+        
+        uniquePoints = unique([complexity_vals, perf_vals], 'rows');
+        perturbedFront = [];
+        for i = 1:size(uniquePoints, 1)
+            matchingRows = (complexity_vals == uniquePoints(i,1)) & (perf_vals == uniquePoints(i,2));
+            numDuplicates = sum(matchingRows);
+            if numDuplicates > 1
+                jitter = 1e-4 * randn(numDuplicates, 2);
+                perturbedPoints = repmat(uniquePoints(i, :), numDuplicates, 1) + jitter;
+            else
+                perturbedPoints = uniquePoints(i, :);
+            end
+            perturbedFront = [perturbedFront; perturbedPoints];
+        end
+        scatter(perturbedFront(:, 1), perturbedFront(:, 2), 36, 'filled');
+        drawnow;
+    end
     
-    % 保存优化结果（使用合法字段名存储在结构中，并将文件名中保留原始 modelType 以便识别）
-    finalParetoStruct = allParetoFronts{end};
-    saveFileName = sprintf('nsga2_results_%s.mat', modelKey); % 用合法名保存文件更稳妥
-    save(saveFileName, 'finalParetoStruct', 'allParetoFronts', 'bestParamsHistory', ...
-         'bestPerformanceHistory', 'bestComplexityHistory', 'specificGenData', 'modelType', 'paramNames');
-    fprintf('%s 模型优化结果已保存至 %s\n', modelType, saveFileName);
+    fprintf('第 %d 代 Pareto 解的数量: %d\n', generation, paretoStruct.numSolutions);
     
-    % 存储到总结果中 - 使用合法字段名
-    allResults.(modelKey) = struct();
-    allResults.(modelKey).modelType = modelType; % 保留原始名称
-    allResults.(modelKey).finalParetoStruct = finalParetoStruct;
-    allResults.(modelKey).allParetoFronts = allParetoFronts;
-    allResults.(modelKey).bestParamsHistory = bestParamsHistory;
-    allResults.(modelKey).bestPerformanceHistory = bestPerformanceHistory;
-    allResults.(modelKey).bestComplexityHistory = bestComplexityHistory;
-    allResults.(modelKey).specificGenData = specificGenData;
-    allResults.(modelKey).paramNames = paramNames;
+    % 选择
+    matingPool = tournamentSelection(population, rank, distance, crossoverFraction, populationSize);
+    
+    % 交叉和变异
+    offspring = crossoverAndMutation(matingPool, lb, ub, intCon, mutationRate);
+    
+    % 评估子代
+    [offspringPerformance, offspringComplexity, ~, ~, ~, ~] = evaluatePopulation(offspring, XTrain, YTrain, XVal, YVal, minSpeed, maxSpeed, sequenceLength, numFeatures);
+    
+    % 合并种群
+    combinedPopulation = [population; offspring];
+    combinedPerformance = [performance; offspringPerformance];
+    combinedComplexity = [complexity; offspringComplexity];
+    
+    % 对合并种群进行快速非支配排序
+    [combinedFronts, combinedRank] = fastNonDominatedSort(combinedPerformance, combinedComplexity);
+    combinedDistance = improvedCrowdingDistance(combinedPerformance, combinedComplexity, combinedFronts);
+    
+    % 环境选择
+    [newPopulation, newPerformance, newComplexity] = environmentalSelection(...
+        combinedPopulation, combinedPerformance, combinedComplexity, combinedRank, combinedDistance, populationSize);
+    
+    % 更新种群
+    population = newPopulation;
+    performance = newPerformance;
+    complexity = newComplexity;
 end
 
-%% 4. 训练每个模型的最优解并评估（最终训练显示训练进度图）
-modelResults = struct();
-for modelIdx = 1:numModels
-    modelType = modelTypes{modelIdx};
-    modelKey = matlab.lang.makeValidName(modelType);
-    fprintf('\n===== 训练 %s 模型的最优解 =====\n', modelType);
-    
-    results = allResults.(modelKey);
-    finalParetoStruct = results.finalParetoStruct;
-    paramNames = results.paramNames;
-
-    if finalParetoStruct.numSolutions == 0
-    warning('%s 模型没有有效的Pareto解，跳过训练', modelType);
-    continue;
-end
-
-% 对帕累托前沿解按性能排序，寻找折中解
-sortedIdx = sortrows(finalParetoStruct.performance);
-numSolutions = finalParetoStruct.numSolutions;
-midIdx = ceil(numSolutions / 2);
-
-% 取中位数解作为折中解
-bestParams = finalParetoStruct.params(sortedIdx(midIdx), :);
-
-% 如果解数量少于 3，取最后一个解
-if numSolutions < 3
-    bestParams = finalParetoStruct.params(end, :);
-end
-
-% 使用 bestParams 训练最终模型
-% 可视化帕累托前沿和折中解
-figure('Name', ['Pareto 前沿与折中解可视化 - ', modelType]);
-scatter(finalParetoStruct.complexity, finalParetoStruct.performance, 'filled');
-hold on;
-plot(finalParetoStruct.complexity(sortedIdx(midIdx)), ...
-     finalParetoStruct.performance(sortedIdx(midIdx)), ...
-     'ro', 'MarkerSize', 12, 'LineWidth', 2, 'DisplayName', '折中解');
-xlabel('模型复杂度');
-ylabel('预测误差 RMSE (m/s)');
-title('帕累托前沿与折中解');
-legend('Location', 'best');
-grid on;
+legend('show');
 hold off;
+fprintf('NSGA-II 优化完成。\n');
 
+%% 4. 保存优化结果
+finalParetoStruct = allParetoFronts{end};
+save('nsga2_optimization_results_extended.mat', 'finalParetoStruct', 'allParetoFronts', 'bestParamsHistory', ...
+     'bestPerformanceHistory', 'bestComplexityHistory', 'specificGenData');
+fprintf('优化结果已保存至 nsga2_optimization_results_extended.mat\n');
 
-   
-    
-    % 解析最优超参数并训练最终模型（trainFinalModel 在最终训练中会展示 training-progress）
-    [net, YValPred_actual, YTestPred_actual, mae_val, rmse_val, mape_val, r_val, mae_test, rmse_test, mape_test, r_test] = ...
-        trainFinalModel(bestParams, XTrain, YTrain, XVal, YVal, XTest, YTest, ...
-        minSpeed, maxSpeed, sequenceLength, numFeatures, modelType);
-    
-    % 存储结果 - 使用安全字段名
-    modelResults.(modelKey) = struct( ...
-        'bestParams', bestParams, ...
-        'paramNames', paramNames, ...
-        'net', net, ...
-        'YValPred_actual', YValPred_actual, ...
-        'YTestPred_actual', YTestPred_actual, ...
-        'mae_val', mae_val, 'rmse_val', rmse_val, 'mape_val', mape_val, 'r_val', r_val, ...
-        'mae_test', mae_test, 'rmse_test', rmse_test, 'mape_test', mape_test, 'r_test', r_test);
-    
-    % 打印性能指标（最终训练保留简洁输出）
-    fprintf('%s 验证: MAE=%.4f m/s, RMSE=%.4f m/s, MAPE=%.2f%%, R=%.4f\n', modelType, mae_val, rmse_val, mape_val, r_val);
-    fprintf('%s 测试: MAE=%.4f m/s, RMSE=%.4f m/s, MAPE=%.2f%%, R=%.4f\n', modelType, mae_test, rmse_test, mape_test, r_test);
-end
+%% ===== 增强可视化部分 =====
+fprintf('开始生成增强可视化图表...\n');
 
-%% ================== 增强可视化（针对 CNN-LSTM 的可视化） ==================
-% 将增强可视化代码插入到这里，针对 CNN-LSTM 的 allParetoFronts & specificGenData & 最终预测结果进行展示
-try
-    modelKeyML = matlab.lang.makeValidName('CNN-LSTM');
-    if ~isfield(allResults, modelKeyML) || ~isfield(modelResults, modelKeyML)
-        warning('未找到 CNN-LSTM 的结果，跳过增强可视化。');
-    else
-        fprintf('开始生成增强可视化图表 for CNN-LSTM...\n');
-        
-        % 从 allResults 提取 CNN-LSTM 的数据
-        cnnResults = allResults.(modelKeyML);
-        cnnModelRes = modelResults.(modelKeyML);
-        specificGenData = cnnResults.specificGenData; % containers.Map
-        allParetoFronts = cnnResults.allParetoFronts;
-        bestPerformanceHistory = cnnResults.bestPerformanceHistory;
-        bestComplexityHistory = cnnResults.bestComplexityHistory;
-        bestParamsHistory = cnnResults.bestParamsHistory;
-        numGenerations = length(allParetoFronts);
-        
-        % 超参数范围与整数索引
-        [lb_ml, ub_ml, intCon_ml, paramNames_ml] = getModelHyperparameterRanges('CNN-LSTM');
-        
-        % final model preds and metrics
-        YValPred_actual = cnnModelRes.YValPred_actual;
-        YTestPred_actual = cnnModelRes.YTestPred_actual;
-        mae_val = cnnModelRes.mae_val;
-        rmse_val = cnnModelRes.rmse_val;
-        mape_val = cnnModelRes.mape_val;
-        r_val = cnnModelRes.r_val;
-        mae_test = cnnModelRes.mae_test;
-        rmse_test = cnnModelRes.rmse_test;
-        mape_test = cnnModelRes.mape_test;
-        r_test = cnnModelRes.r_test;
-        
-        % specific gens to visualize (user requested 1,5,10,20)
-        specificGens = [1, 5, 10, 20];
-        
-        %% 可视化1：特定代数的Pareto前沿对比
-        figure('Name', 'Specific Generations Pareto Fronts Comparison', 'Position', [100, 100, 1200, 800]);
-        colors = {'r', 'g', 'b', 'm'};
-        markers = {'o', 's', '^', 'd'};
-        markerSizes = [80, 70, 60, 50];
-        
-        for i = 1:length(specificGens)
-            gen = specificGens(i);
-            subplot(2,2,i);
-            if isKey(specificGenData, gen)
-                data = specificGenData(gen);
-                paretoStruct = data.paretoFront;
-                if isstruct(paretoStruct) && isfield(paretoStruct, 'numSolutions') && paretoStruct.numSolutions > 0
-                    perf_vals = paretoStruct.performance;
-                    complexity_vals = paretoStruct.complexity;
-                    scatter(complexity_vals, perf_vals, markerSizes(i), colors{i}, markers{i}, ...
-                        'filled', 'DisplayName', sprintf('第%d代', gen));
-                    xlabel('模型复杂度');
-                    ylabel('预测误差 RMSE (m/s)');
-                    title(sprintf('第%d代 Pareto 前沿 (%d个解)', gen, paretoStruct.numSolutions));
-                    
-                    % 添加文本标注显示解的数量和范围（防护：复杂度或perf可能为常数）
-                    try
-                        minC = min(complexity_vals); maxC = max(complexity_vals);
-                        minP = min(perf_vals); maxP = max(perf_vals);
-                        dx = max(1, 0.1 * (maxC - minC));
-                        dy = max(1e-3, 0.1 * (maxP - minP));
-                        text_x = minC + 0.05 * (maxC - minC);
-                        text_y = maxP - 0.05 * (maxP - minP);
-                        text(text_x, text_y, sprintf('解的数量: %d\nRMSE范围: [%.3f, %.3f]\n复杂度范围: [%d, %d]', ...
-                             paretoStruct.numSolutions, minP, maxP, round(minC), round(maxC)), ...
-                             'FontSize', 8, 'BackgroundColor', 'white');
-                    catch
-                    end
-                    grid on;
-                else
-                    axis([0 1 0 1]); axis off;
-                    text(0.5, 0.5, sprintf('第%d代无有效Pareto解', gen), ...
-                         'HorizontalAlignment', 'center', 'FontSize', 12);
-                end
-            else
-                axis([0 1 0 1]); axis off;
-                text(0.5, 0.5, sprintf('第%d代数据未记录', gen), ...
-                     'HorizontalAlignment', 'center', 'FontSize', 12);
-            end
-        end
-        
-        %% 可视化2：Pareto前沿进化动画（静态多帧显示）
-        figure('Name', 'Pareto Front Evolution Animation Frames', 'Position', [150, 150, 1400, 800]);
-        animationGens = [1, 3, 5, 8, 10, 12, 15, 20];
-        animationGens = animationGens(animationGens <= numGenerations);
-        if isempty(animationGens)
-            % fallback to available gens
-            animationGens = 1:numGenerations;
-        end
-        
-        for i = 1:length(animationGens)
-            gen = animationGens(i);
-            subplot(2, 4, i);
-            
-            % 绘制当前代及之前所有代的Pareto点（淡化历史）
-            hold on;
-            for prevGen = 1:gen
-                paretoStruct = allParetoFronts{prevGen};
-                if isstruct(paretoStruct) && isfield(paretoStruct, 'numSolutions') && paretoStruct.numSolutions > 0
-                    perf_vals = paretoStruct.performance;
-                    complexity_vals = paretoStruct.complexity;
-                    alphaVal = max(0.05, (prevGen/gen)^2); % 历史代数越远越淡
-                    % 使用 scatter 并设置透明度（MarkerFaceAlpha 可用）
-                    scatter(complexity_vals, perf_vals, 30, [0.7 0.7 0.7], 'filled', 'MarkerFaceAlpha', alphaVal);
-                end
-            end
-            
-            % 突出显示当前代
-            paretoStruct = allParetoFronts{gen};
-            if isstruct(paretoStruct) && isfield(paretoStruct, 'numSolutions') && paretoStruct.numSolutions > 0
-                perf_vals = paretoStruct.performance;
-                complexity_vals = paretoStruct.complexity;
-                scatter(complexity_vals, perf_vals, 80, 'r', 'filled');
-            end
-            
-            xlabel('模型复杂度');
-            ylabel('预测误差 RMSE (m/s)');
-            title(sprintf('第%d代', gen));
-            grid on;
-            hold off;
-        end
-        
-        %% 可视化3：超参数分布分析（针对最后一代或特定代）
-        figure('Name', 'Hyperparameter Distribution Analysis', 'Position', [200, 200, 1400, 1000]);
-        % 参数名（fallback）
-        paramNamesShort = {'BatchSize', 'LearnRate', 'PoolType', 'NumFilters1', 'FilterSize1', ...
-                  'LSTMUnits1', 'LSTMUnits2', 'RegType', 'DropoutProb1', 'DropoutProb2', ...
-                  'OptimizerType', 'NumConvLayers', 'ConvDropout', 'ActivationFunction'};
-        
-        % 分析最后一代（如果存在第20代，优先取20）
-        targetGen = min(20, numGenerations);
-        if isKey(specificGenData, targetGen)
-            data = specificGenData(targetGen);
-            paretoStruct = data.paretoFront;
-        else
-            paretoStruct = allParetoFronts{end};
-        end
-        
-        if isstruct(paretoStruct) && isfield(paretoStruct, 'numSolutions') && paretoStruct.numSolutions > 0
-            paretoParams = paretoStruct.params; % 直接从结构化数据获取超参数
-            importantParams = [1, 2, 4, 6, 7, 9, 10, 11, 12, 13, 14]; % 重要参数索引
-            
-            for i = 1:length(importantParams)
-                paramIdx = importantParams(i);
-                subplot(3, 4, i);
-                if ismember(paramIdx, intCon_ml) % 整数参数用直方图
-                    histogram(paretoParams(:, paramIdx), 'Normalization', 'count');
-                    xlabel(paramNamesShort{paramIdx});
-                    ylabel('Count');
-                    title(sprintf('%s 分布', paramNamesShort{paramIdx}));
-                else % 连续参数用密度图（hist probability）
-                    histogram(paretoParams(:, paramIdx), 20, 'Normalization', 'probability');
-                    xlabel(paramNamesShort{paramIdx});
-                    ylabel('Probability');
-                    title(sprintf('%s 分布', paramNamesShort{paramIdx}));
-                end
-                grid on;
-            end
-        else
-            axis off;
-            text(0.5, 0.5, '无法获取用于超参数分布分析的Pareto解', 'HorizontalAlignment', 'center');
-        end
-        
-        %% 可视化4：性能指标多代对比
-        figure('Name', 'Performance Metrics Comparison', 'Position', [250, 250, 1200, 600]);
-        genStats = [];
-        for gen = specificGens
-            if isKey(specificGenData, gen)
-                data = specificGenData(gen);
-                paretoStruct = data.paretoFront;
-            elseif gen <= numGenerations
-                paretoStruct = allParetoFronts{gen};
-            else
-                paretoStruct = struct('numSolutions',0);
-            end
-            if isstruct(paretoStruct) && isfield(paretoStruct, 'numSolutions') && paretoStruct.numSolutions > 0
-                perf_vals = paretoStruct.performance;
-                stats = [gen, length(perf_vals), min(perf_vals), mean(perf_vals), max(perf_vals)];
-                genStats = [genStats; stats]; %#ok<AGROW>
-            end
-        end
-        
-        if ~isempty(genStats)
-            subplot(1,3,1);
-            bar(genStats(:,1), genStats(:,2));
-            xlabel('代数');
-            ylabel('Pareto解数量');
-            title('各代Pareto解数量');
-            grid on;
-            
-            subplot(1,3,2);
-            plot(genStats(:,1), genStats(:,3), 'ro-', 'LineWidth', 2, 'DisplayName', '最小RMSE');
-            hold on;
-            plot(genStats(:,1), genStats(:,4), 'bs-', 'LineWidth', 2, 'DisplayName', '平均RMSE');
-            plot(genStats(:,1), genStats(:,5), 'g^-', 'LineWidth', 2, 'DisplayName', '最大RMSE');
-            xlabel('代数');
-            ylabel('RMSE (m/s)');
-            title('各代RMSE统计');
-            legend('Location', 'best');
-            grid on;
-            hold off;
-            
-            subplot(1,3,3);
-            improvement = (genStats(1,3) - genStats(:,3)) ./ genStats(1,3) * 100;
-            bar(genStats(:,1), improvement);
-            xlabel('代数');
-            ylabel('改进百分比 (%)');
-            title('相对第1代的RMSE改进');
-            grid on;
-        else
-            axis off;
-            text(0.5, 0.5, '没有用于多代性能对比的数据', 'HorizontalAlignment', 'center');
-        end
-        
-        %% 可视化5：3D Pareto 前沿及性能-复杂度权衡
-        figure('Name', '3D Pareto Analysis & Tradeoff', 'Position', [300, 300, 1000, 700]);
-        subplot(1,2,1);
-        finalParetoStruct = allParetoFronts{end};
-        if isstruct(finalParetoStruct) && finalParetoStruct.numSolutions > 0
-            perf_vals = finalParetoStruct.performance;
-            complexity_vals = finalParetoStruct.complexity;
-            param_counts = sum(finalParetoStruct.params, 2); % 简单求和作为参数复杂度指标
-            scatter3(complexity_vals, perf_vals, param_counts, 100, 'filled');
-            xlabel('模型复杂度');
-            ylabel('预测误差 RMSE (m/s)');
-            zlabel('参数总和');
-            title('3D Pareto 分析');
-            grid on;
-            view(45, 30);
-        else
-            axis off;
-            text(0.5, 0.5, '最终代无Pareto解', 'HorizontalAlignment', 'center');
-        end
-        
-        subplot(1,2,2);
-        if isstruct(finalParetoStruct) && finalParetoStruct.numSolutions > 0
-            perf_vals = finalParetoStruct.performance;
-            complexity_vals = finalParetoStruct.complexity;
-            [sorted_complexity, sort_idx] = sort(complexity_vals);
-            sorted_perf = perf_vals(sort_idx);
-            plot(sorted_complexity, sorted_perf, 'bo-', 'LineWidth', 2, 'MarkerSize', 8);
-            xlabel('模型复杂度');
-            ylabel('预测误差 RMSE (m/s)');
-            title('性能-复杂度权衡曲线');
-            grid on;
-            hold on;
-            [min_rmse, min_idx] = min(sorted_perf);
-            [min_complexity, min_comp_idx] = min(sorted_complexity);
-            plot(sorted_complexity(min_idx), min_rmse, 'ro', 'MarkerSize', 12, 'LineWidth', 3);
-            plot(min_complexity, sorted_perf(min_comp_idx), 'go', 'MarkerSize', 12, 'LineWidth', 3);
-            text(sorted_complexity(min_idx), min_rmse + 0.01, '最小RMSE', 'HorizontalAlignment', 'center');
-            text(min_complexity, sorted_perf(min_comp_idx) + 0.01, '最小复杂度', 'HorizontalAlignment', 'center');
-            hold off;
-        else
-            axis off;
-            text(0.5, 0.5, '无法绘制性能-复杂度曲线', 'HorizontalAlignment', 'center');
-        end
-        
-        %% ===== 最终模型的预测可视化（综合分析） =====
-        try
-            figure('Name','Final Model - Comprehensive Prediction Analysis','Position',[100,100,1400,1000]);
-            
-            % 确保存在必要变量
-            if isempty(YVal_actual) || isempty(YValPred_actual)
-                warning('缺少验证集实际或预测值，跳过最终模型预测可视化子图1。');
-            else
-                subplot(2,3,1);
-                plot(YVal_actual, 'b-', 'LineWidth', 1.5, 'DisplayName', '验证集真实值'); hold on;
-                plot(YValPred_actual, 'r--', 'LineWidth', 1.5, 'DisplayName', '验证集预测值');
-                xlabel('时间步'); ylabel('风速 (m/s)');
-                title(sprintf('验证集预测效果 (RMSE=%.3f)', rmse_val));
-                legend('Location','best'); grid on;
-            end
-            
-            if isempty(YTest_actual) || isempty(YTestPred_actual)
-                warning('缺少测试集实际或预测值，跳过最终模型预测可视化子图2-6。');
-            else
-                % 子图2: 测试集预测效果
-                subplot(2,3,2);
-                plot(YTest_actual, 'b-', 'LineWidth', 1.5, 'DisplayName', '测试集真实值'); hold on;
-                plot(YTestPred_actual, 'r--', 'LineWidth', 1.5, 'DisplayName', '测试集预测值');
-                xlabel('时间步'); ylabel('风速 (m/s)');
-                title(sprintf('测试集预测效果 (RMSE=%.3f)', rmse_test));
-                legend('Location','best'); grid on;
-                
-                % 子图3: 测试集残差分析
-                subplot(2,3,3);
-                errors_test = YTest_actual - YTestPred_actual;
-                histogram(errors_test, 30, 'Normalization', 'probability');
-                xlabel('预测误差 (m/s)'); ylabel('概率密度');
-                title(sprintf('测试集误差分布 (均值=%.3f)', mean(errors_test)));
-                grid on;
-                
-                % 子图4: 测试集散点图
-                subplot(2,3,4);
-                scatter(YTest_actual, YTestPred_actual, 50, 'filled', 'MarkerFaceAlpha', 0.6);
-                hold on;
-                xy = [min(YTest_actual) max(YTest_actual)];
-                plot(xy, xy, 'k--', 'LineWidth', 2);
-                xlabel('真实值 (m/s)'); ylabel('预测值 (m/s)');
-                title(sprintf('预测 vs 真实 (R=%.3f)', r_test));
-                grid on;
-                axis equal; axis tight;
-                
-                % 子图5: 验证集和测试集性能对比
-                subplot(2,3,5);
-                metrics = {'MAE', 'RMSE', 'MAPE', 'R'};
-                val_metrics = [mae_val, rmse_val, mape_val, r_val];
-                test_metrics = [mae_test, rmse_test, mape_test, r_test];
-                x = categorical(metrics);
-                bar(x, [val_metrics; test_metrics]');
-                legend({'验证集', '测试集'}, 'Location', 'best');
-                ylabel('指标值');
-                title('验证集 vs 测试集性能对比');
-                grid on;
-                
-                % 子图6: 预测误差时间序列
-                subplot(2,3,6);
-                plot(abs(errors_test), 'g-', 'LineWidth', 1);
-                xlabel('时间步'); ylabel('绝对误差 (m/s)');
-                title('测试集绝对误差时间序列');
-                grid on;
-                
-                % 添加误差统计线
-                mean_abs_error = mean(abs(errors_test));
-                std_abs_error = std(abs(errors_test));
-                hold on;
-                yline(mean_abs_error, 'r--', sprintf('均值=%.3f', mean_abs_error), 'LineWidth', 2);
-                yline(mean_abs_error + std_abs_error, 'r:', sprintf('+1σ=%.3f', mean_abs_error + std_abs_error));
-                yline(max(0, mean_abs_error - std_abs_error), 'r:', sprintf('-1σ=%.3f', max(0, mean_abs_error - std_abs_error)));
-                hold off;
-            end
-        catch e_inner
-            warning('最终模型的预测可视化出现异常：%s', e_inner.message);
-        end
-        
-        %% 生成综合报告可视化（基于 CNN-LSTM 的优化过程）
-        figure('Name', 'Comprehensive Optimization Report (CNN-LSTM)', 'Position', [400, 400, 1600, 1200]);
-        
-        maxG = numGenerations;
-        subplot(3,4,1);
-        if exist('bestPerformanceHistory','var') && ~isempty(bestPerformanceHistory)
-            plot(1:maxG, bestPerformanceHistory(1:maxG), 'bo-', 'LineWidth', 2);
-            xlabel('代数'); ylabel('最优 RMSE (m/s)');
-            title('优化历程 - 最优RMSE');
-            grid on;
-        else
-            title('无最优RMSE历史数据');
-        end
-        
-        subplot(3,4,2);
-        if exist('bestComplexityHistory','var') && ~isempty(bestComplexityHistory)
-            plot(1:maxG, bestComplexityHistory(1:maxG), 'ro-', 'LineWidth', 2);
-            xlabel('代数'); ylabel('对应复杂度');
-            title('优化历程 - 对应复杂度');
-            grid on;
-        end
-        
-        subplot(3,4,3);
-        numPareto = zeros(maxG,1);
-        for g = 1:maxG
-            p = allParetoFronts{g};
-            if isstruct(p) && isfield(p,'numSolutions')
-                numPareto(g) = p.numSolutions;
-            else
-                numPareto(g) = 0;
-            end
-        end
-        bar(1:maxG, numPareto);
-        xlabel('代数'); ylabel('Pareto解数量');
-        title('各代Pareto解数量');
-        grid on;
-        
-        subplot(3,4,4);
-        finalP = allParetoFronts{end};
-        if isstruct(finalP) && finalP.numSolutions > 0
-            optimizerDist = finalP.params(:, 11);
-            histogram(optimizerDist, 'BinEdges', [0.5,1.5,2.5,3.5]);
-            xticks([1 2 3]);
-            xticklabels({'Adam','SGDM','RMSprop'});
-            xlabel('优化器类型'); ylabel('数量');
-            title('最终Pareto解优化器分布');
-            grid on;
-        else
-            title('最终Pareto无数据');
-        end
-        
-        % Key param evolution plots
-        keyParams = [1, 2, 6, 7]; % BatchSize, LearnRate, LSTMUnits1, LSTMUnits2
-        paramTitles = {'BatchSize进化', 'LearnRate进化', 'LSTM Units1进化', 'LSTM Units2进化'};
-        for i = 1:4
-            subplot(3,4,4+i);
-            paramIdx = keyParams(i);
-            % 从 bestParamsHistory 提取（cell -> row vector）
-            pe = nan(maxG,1);
-            for g = 1:maxG
-                bp = bestParamsHistory{g};
-                if ~isempty(bp) && length(bp) >= paramIdx
-                    pe(g) = bp(paramIdx);
-                end
-            end
-            plot(1:maxG, pe, 'o-', 'LineWidth', 1.5);
-            xlabel('代数'); ylabel(paramTitles{i});
-            title(paramTitles{i});
-            grid on;
-        end
-        
-        subplot(3,4,9);
-        finalParetoStruct = allParetoFronts{end};
-        if isstruct(finalParetoStruct) && finalParetoStruct.numSolutions > 0
-            perf_vals = finalParetoStruct.performance;
-            complexity_vals = finalParetoStruct.complexity;
-            scatter(complexity_vals, perf_vals, 100, 'filled');
-            xlabel('模型复杂度'); ylabel('预测误差 RMSE (m/s)');
-            title(sprintf('最终Pareto前沿 (%d个解)', finalParetoStruct.numSolutions));
-            grid on;
-            [min_rmse, min_idx] = min(perf_vals);
-            hold on;
-            plot(complexity_vals(min_idx), min_rmse, 'r*', 'MarkerSize', 15, 'LineWidth', 3);
-            text(complexity_vals(min_idx), min_rmse + 0.01, '最优解', 'HorizontalAlignment', 'center');
-            hold off;
-        else
-            title('最终Pareto无数据');
-        end
-        
-        subplot(3,4,10);
-        if length(bestPerformanceHistory) > 1
-            improvement = (bestPerformanceHistory(1) - bestPerformanceHistory) ./ bestPerformanceHistory(1) * 100;
-            plot(1:maxG, improvement(1:maxG), 'g-', 'LineWidth', 2);
-            xlabel('代数'); ylabel('改进百分比 (%)');
-            title('相对初始代的性能改进');
-            grid on;
-        end
-        
-        subplot(3,4,11);
-        finalParetoStruct = allParetoFronts{end};
-        if isstruct(finalParetoStruct) && finalParetoStruct.numSolutions > 0
-            perf_vals = finalParetoStruct.performance;
-            complexity_vals = finalParetoStruct.complexity;
-            normalized_perf = (perf_vals - min(perf_vals)) / (max(perf_vals) - min(perf_vals) + eps);
-            normalized_comp = (complexity_vals - min(complexity_vals)) / (max(complexity_vals) - min(complexity_vals) + eps);
-            tradeoff_ratio = normalized_perf ./ (normalized_comp + eps);
-            [sorted_ratio, sort_idx] = sort(tradeoff_ratio);
-            plot(1:length(sorted_ratio), sorted_ratio, 'bo-', 'LineWidth', 1.5);
-            xlabel('解的排序'); ylabel('权衡比率');
-            title('性能-复杂度权衡分析');
-            grid on;
-        else
-            title('无法进行权衡分析');
-        end
-        
-        subplot(3,4,12);
-        if isstruct(finalParetoStruct) && finalParetoStruct.numSolutions > 0
-            [~, bestIdx_final] = min(finalParetoStruct.performance);
-            bestSolution = finalParetoStruct.params(bestIdx_final, :);
-            normalizedParams = (bestSolution - lb_ml) ./ (ub_ml - lb_ml + eps);
-            keyParamIdx = [1, 2, 4, 6, 7, 9, 10, 11, 14];
-            keyParamNames = {'Batch', 'LR', 'Filters', 'LSTM1', 'LSTM2', 'Drop1', 'Drop2', 'Opt', 'Act'};
-            keyValues = normalizedParams(keyParamIdx);
-            angles = linspace(0, 2*pi, length(keyValues)+1);
-            values = [keyValues, keyValues(1)];
-            polarplot(angles, values, 'ro-','LineWidth',1.5);
-            title('最优解超参数分布 (归一化)');
-        else
-            title('最优解超参数不可用');
-        end
-        
-        fprintf('增强可视化已生成。\n');
-    end
-catch e
-    warning('增强可视化生成失败：%s', e.message);
-end
-
-%% 5. 其他模型总体比较可视化（保留之前的多模型对比图，若需要可定制）
-% 以下为先前脚本中的多模型对比（如果可用）
-try
-    availableModels = {};
-    rmse_list = [];
-    mae_list = [];
-    mape_list = [];
-    r_list = [];
-    
-    for modelIdx = 1:numModels
-        modelType = modelTypes{modelIdx};
-        modelKey = matlab.lang.makeValidName(modelType);
-        if ~isfield(modelResults, modelKey)
-            continue;
-        end
-        availableModels{end+1} = modelType; %#ok<SAGROW>
-        res = modelResults.(modelKey);
-        rmse_list(end+1) = res.rmse_test; %#ok<SAGROW>
-        mae_list(end+1) = res.mae_test; %#ok<SAGROW>
-        mape_list(end+1) = res.mape_test; %#ok<SAGROW>
-        r_list(end+1) = res.r_test; %#ok<SAGROW>
-    end
-    
-    numAvail = length(availableModels);
-    if numAvail > 0
-        % 预测 vs 实际（测试集）——多子图
-        fig1 = figure('Name','Test Predictions vs Actuals','NumberTitle','off','Units','normalized','Position',[0.05 0.05 0.9 0.8]);
-        t = tiledlayout(ceil(numAvail/2),2,'TileSpacing','compact','Padding','compact');
-        for k = 1:numAvail
-            nexttile;
-            modelType = availableModels{k};
-            modelKey = matlab.lang.makeValidName(modelType);
-            res = modelResults.(modelKey);
-            ypred = res.YTestPred_actual;
-            if isempty(ypred)
-                plot([]); title(sprintf('%s: 无预测', modelType));
-                continue;
-            end
-            plot(YTest_actual, '-k', 'LineWidth', 1); hold on;
-            plot(ypred, '-r', 'LineWidth', 1);
-            xlabel('样本索引'); ylabel('风速 (m/s)');
-            title(sprintf('%s 测试集: 实际 vs 预测', modelType), 'Interpreter','none');
-            legend({'实际','预测'}, 'Location','best');
-            grid on; hold off;
-        end
-        try; saveas(fig1, 'models_test_predictions.png'); end
-        
-        % 散点图：实际 vs 预测（合并子图）
-        fig2 = figure('Name','Actual vs Predicted Scatter','NumberTitle','off','Units','normalized','Position',[0.1 0.1 0.7 0.6]);
-        colors = lines(numAvail);
-        hold on;
-        maxVal = max(YTest_actual);
-        minVal = min(YTest_actual);
-        for k = 1:numAvail
-            modelType = availableModels{k};
-            modelKey = matlab.lang.makeValidName(modelType);
-            res = modelResults.(modelKey);
-            ypred = res.YTestPred_actual;
-            if isempty(ypred), continue; end
-            scatter(YTest_actual, ypred, 20, 'MarkerEdgeColor', colors(k,:), 'DisplayName', modelType);
-        end
-        plot([minVal maxVal],[minVal maxVal],'k--','LineWidth',1,'DisplayName','y=x');
-        xlabel('实际 (m/s)'); ylabel('预测 (m/s)');
-        title('测试集：实际 vs 预测（散点）');
-        legend('Location','bestoutside');
-        grid on; hold off;
-        try; saveas(fig2, 'models_scatter_actual_vs_pred.png'); end
-        
-        % 指标柱状图（RMSE / MAE / MAPE）
-        fig3 = figure('Name','Model Metrics Comparison','NumberTitle','off','Units','normalized','Position',[0.1 0.1 0.7 0.6]);
-        subplot(2,1,1);
-        barData = [rmse_list; mae_list]';
-        bar(barData);
-        set(gca,'XTickLabel', availableModels, 'XTickLabelRotation', 45);
-        ylabel('误差 (m/s)'); legend({'RMSE','MAE'}, 'Location','best');
-        title('模型测试集误差比较');
-        
-        subplot(2,1,2);
-        yyaxis left;
-        bar(mape_list, 'FaceColor',[0.2 0.6 0.8]);
-        ylabel('MAPE (%)');
-        yyaxis right;
-        plot(r_list, '-o', 'Color',[0.85 0.33 0.1],'LineWidth',1.5);
-        ylabel('相关系数 R');
-        set(gca,'XTick',1:numAvail,'XTickLabel',availableModels,'XTickLabelRotation',45);
-        title('MAPE 与 相关系数');
-        try; saveas(fig3, 'models_metrics_comparison.png'); end
-    else
-        fprintf('没有可用于可视化的最终模型结果。\n');
-    end
-
-    %% 可视化1：特定代数的Pareto前沿对比
+%% 可视化1：特定代数（1, 5, 10, 20）的Pareto前沿对比
 figure('Name', 'Specific Generations Pareto Fronts Comparison', 'Position', [100, 100, 1200, 800]);
+
+% 使用不同颜色和标记
 colors = {'r', 'g', 'b', 'm'};
 markers = {'o', 's', '^', 'd'};
 markerSizes = [80, 70, 60, 50];
-specificGens = [1, 5, 10, 20];
 
 for i = 1:length(specificGens)
     gen = specificGens(i);
     subplot(2,2,i);
-    
-    % 检查是否记录了该代的数据
     if isKey(specificGenData, gen)
         data = specificGenData(gen);
         paretoStruct = data.paretoFront;
-    else
-        % 如果没有记录，则尝试从 allParetoFronts 中获取
-        if gen <= length(allParetoFronts)
-            paretoStruct = allParetoFronts{gen};
-        else
-            paretoStruct = struct('numSolutions', 0);
-        end
-    end
-    
-    if isstruct(paretoStruct) && isfield(paretoStruct, 'numSolutions') && paretoStruct.numSolutions > 0
-        perf_vals = paretoStruct.performance;
-        complexity_vals = paretoStruct.complexity;
-        scatter(complexity_vals, perf_vals, markerSizes(i), colors{i}, markers{i}, ...
-            'filled', 'DisplayName', sprintf('第%d代', gen));
-        xlabel('模型复杂度');
-        ylabel('预测误差 RMSE (m/s)');
-        title(sprintf('第%d代 Pareto 前沿 (%d个解)', gen, paretoStruct.numSolutions));
-        
-        % 添加文本标注显示解的数量和范围
-        try
-            minC = min(complexity_vals); maxC = max(complexity_vals);
-            minP = min(perf_vals); maxP = max(perf_vals);
-            dx = max(1, 0.1 * (maxC - minC));
-            dy = max(1e-3, 0.1 * (maxP - minP));
-            text_x = minC + 0.05 * (maxC - minC);
-            text_y = maxP - 0.05 * (maxP - minP);
+        if paretoStruct.numSolutions > 0
+            % 直接从结构化数据中提取目标值
+            perf_vals = paretoStruct.performance;
+            complexity_vals = paretoStruct.complexity;
+            scatter(complexity_vals, perf_vals, markerSizes(i), colors{i}, 'filled', markers{i}, ...
+                   'DisplayName', sprintf('第%d代', gen));
+            xlabel('模型复杂度');
+            ylabel('预测误差 RMSE (m/s)');
+            title(sprintf('第%d代 Pareto 前沿 (%d个解)', gen, paretoStruct.numSolutions));
+            
+            % 添加文本标注显示解的数量和范围
+            text_x = min(complexity_vals) + 0.1 * (max(complexity_vals) - min(complexity_vals));
+            text_y = max(perf_vals) - 0.1 * (max(perf_vals) - min(perf_vals));
             text(text_x, text_y, sprintf('解的数量: %d\nRMSE范围: [%.3f, %.3f]\n复杂度范围: [%d, %d]', ...
-                 paretoStruct.numSolutions, minP, maxP, round(minC), round(maxC)), ...
+                 paretoStruct.numSolutions, min(perf_vals), max(perf_vals), ...
+                 min(complexity_vals), max(complexity_vals)), ...
                  'FontSize', 8, 'BackgroundColor', 'white');
-        catch
+            grid on;
+        else
+            text(0.5, 0.5, sprintf('第%d代无有效Pareto解', gen), ...
+                 'HorizontalAlignment', 'center', 'FontSize', 12);
         end
-        grid on;
     else
-        axis([0 1 0 1]); axis off;
-        text(0.5, 0.5, sprintf('第%d代无有效Pareto解', gen), ...
+        text(0.5, 0.5, sprintf('第%d代数据未记录', gen), ...
              'HorizontalAlignment', 'center', 'FontSize', 12);
     end
 end
 
-catch e
-    warning('多模型比较可视化失败：%s', e.message);
+%% 可视化2：Pareto前沿进化动画（静态多帧显示）
+figure('Name', 'Pareto Front Evolution Animation Frames', 'Position', [150, 150, 1400, 800]);
+animationGens = [1, 3, 5, 8, 10, 12, 15, 20]; % 选择8个关键代数
+
+for i = 1:length(animationGens)
+    gen = animationGens(i);
+    subplot(2, 4, i);
+    
+    % 绘制当前代及之前所有代的Pareto点（淡化历史）
+    hold on;
+    for prevGen = 1:gen
+        paretoStruct = allParetoFronts{prevGen};
+        if paretoStruct.numSolutions > 0
+            perf_vals = paretoStruct.performance;
+            complexity_vals = paretoStruct.complexity;
+            alpha = max(0.1, (prevGen/gen)^2); % 历史代数越远越淡
+            scatter(complexity_vals, perf_vals, 30, [0.7 0.7 0.7], 'filled', 'MarkerFaceAlpha', alpha);
+        end
+    end
+    
+    % 突出显示当前代
+    paretoStruct = allParetoFronts{gen};
+    if paretoStruct.numSolutions > 0
+        perf_vals = paretoStruct.performance;
+        complexity_vals = paretoStruct.complexity;
+        scatter(complexity_vals, perf_vals, 80, 'r', 'filled');
+    end
+    
+    xlabel('模型复杂度');
+    ylabel('预测误差 RMSE (m/s)');
+    title(sprintf('第%d代', gen));
+    grid on;
+    hold off;
 end
 
-%% 6. 打印所有模型的优化后超参数（安全获取参数名）
-for modelIdx = 1:numModels
-    modelType = modelTypes{modelIdx};
-    modelKey = matlab.lang.makeValidName(modelType);
-    if ~isfield(modelResults, modelKey)
-        continue;
-    end
-    
-    fprintf('\n=== %s 模型最终优化的超参数 ===\n', modelType);
-    results = modelResults.(modelKey);
-    bestParams = results.bestParams;
-    paramNames = results.paramNames;
-    
-    % 确保参数名称和参数数量匹配
-    if length(paramNames) ~= length(bestParams)
-        warning('参数名称与参数数量不匹配，可能存在错误');
-        continue;
-    end
-    
-    [lb, ub, intCon, ~] = getModelHyperparameterRanges(modelType);
-    for i = 1:length(bestParams)
-        name = paramNameToStr(paramNames, i);
-        if ismember(i, intCon)
-            fprintf('%s: %d\n', name, round(bestParams(i)));
-        else
-            fprintf('%s: %.6f\n', name, bestParams(i));
+%% 可视化3：超参数分布分析（针对特定代数）
+figure('Name', 'Hyperparameter Distribution Analysis', 'Position', [200, 200, 1400, 1000]);
+
+paramNames = {'BatchSize', 'LearnRate', 'PoolType', 'NumFilters1', 'FilterSize1', ...
+              'LSTMUnits1', 'LSTMUnits2', 'RegType', 'DropoutProb1', 'DropoutProb2', ...
+              'OptimizerType', 'NumConvLayers', 'ConvDropout', 'ActivationFunction'};
+
+% 只分析最后一代的Pareto解
+if isKey(specificGenData, 20)
+    data = specificGenData(20);
+    paretoStruct = data.paretoFront;
+    if paretoStruct.numSolutions > 0
+        paretoParams = paretoStruct.params; % 直接从结构化数据获取超参数
+        
+        % 选择几个重要参数进行可视化
+        importantParams = [1, 2, 4, 6, 7, 9, 10, 11, 12, 13, 14]; % 重要参数索引
+        
+        for i = 1:length(importantParams)
+            paramIdx = importantParams(i);
+            subplot(3, 4, i);
+            
+            if ismember(paramIdx, intCon) % 整数参数用直方图
+                histogram(paretoParams(:, paramIdx), 'Normalization', 'count');
+                xlabel(paramNames{paramIdx});
+                ylabel('Count');
+                title(sprintf('%s 分布', paramNames{paramIdx}));
+            else % 连续参数用密度图
+                histogram(paretoParams(:, paramIdx), 20, 'Normalization', 'probability');
+                xlabel(paramNames{paramIdx});
+                ylabel('Probability');
+                title(sprintf('%s 分布', paramNames{paramIdx}));
+            end
+            grid on;
         end
     end
 end
 
-fprintf('\n增强可视化与对比已完成。\n');
+%% 可视化4：性能指标对比（多代对比）
+figure('Name', 'Performance Metrics Comparison', 'Position', [250, 250, 1200, 600]);
 
-%% ================== 局部辅助函数 ================== %% 
-
-%% 获取模型超参数范围
-function [lb, ub, intCon, paramNames] = getModelHyperparameterRanges(modelType)
-    switch modelType
-        case 'CNN-LSTM'
-            % 变量顺序：14个超参数
-            lb = [32, 1e-6, 1, 16, 2, 32, 32, 1, 0.2, 0.2, 1, 1, 0.1, 1];
-            ub = [128, 1e-3, 2, 256, 5, 128, 128, 3, 0.4, 0.4, 3, 2, 0.3, 4];
-            intCon = [1,3,4,5,6,7,8,11,12,14];
-            paramNames = {'Batch Size', 'Learn Rate', 'Pool Type', ...
-                          'Num Filters1', 'Filter Size1', 'LSTM Units1', ...
-                          'LSTM Units2', 'Reg Type', 'Dropout Prob1', 'Dropout Prob2', ...
-                          'OptimizerType', 'NumConvLayers', 'ConvDropout', 'ActivationFunction'};
-            
-        case 'CNN'
-            % 变量顺序：13个超参数
-            lb = [32, 1e-6, 1, 16, 2, 16, 2, 32, 1, 0.2, 1, 1, 1];
-            ub = [128, 1e-3, 2, 256, 5, 256, 5, 256, 3, 0.5, 3, 3, 4];
-            intCon = [1,3,4,5,6,7,8,9,11,12,13];
-            paramNames = {'Batch Size', 'Learn Rate', 'Pool Type', ...
-                          'Num Filters1', 'Filter Size1', 'Num Filters2', ...
-                          'Filter Size2', 'Num FC Units', 'Reg Type', 'Dropout Prob', ...
-                          'OptimizerType', 'NumConvLayers', 'ActivationFunction'};
-            
-        case 'LSTM'
-            % 变量顺序：11个超参数
-            lb = [32, 1e-6, 32, 16, 0, 1, 0.2, 0.2, 1, 1, 1];
-            ub = [128, 1e-3, 128, 128, 128, 3, 0.5, 0.5, 3, 3, 4];
-            intCon = [1,3,4,5,6,9,10,11];
-            paramNames = {'Batch Size', 'Learn Rate', 'LSTM Units1', ...
-                          'LSTM Units2', 'LSTM Units3', 'Reg Type', ...
-                          'Dropout Prob1', 'Dropout Prob2', 'OptimizerType', ...
-                          'NumLSTMLayers', 'ActivationFunction'};
-            
-        case 'GRU'
-            % 变量顺序：11个超参数
-            lb = [32, 1e-6, 32, 16, 0, 1, 0.2, 0.2, 1, 1, 1];
-            ub = [128, 1e-3, 128, 128, 128, 3, 0.5, 0.5, 3, 3, 4];
-            intCon = [1,3,4,5,6,9,10,11];
-            paramNames = {'Batch Size', 'Learn Rate', 'GRU Units1', ...
-                          'GRU Units2', 'GRU Units3', 'Reg Type', ...
-                          'Dropout Prob1', 'Dropout Prob2', 'OptimizerType', ...
-                          'NumGRULayers', 'ActivationFunction'};
-            
-        case 'Transformer'
-            % 变量顺序：10个超参数
-            lb = [32, 1e-6, 2, 64, 1, 128, 1, 0.1, 1, 1];
-            ub = [128, 1e-3, 8, 256, 4, 512, 3, 0.4, 3, 4];
-            intCon = [1,3,5,7,9,10];
-            paramNames = {'Batch Size', 'Learn Rate', 'Num Heads', ...
-                          'Hidden Size', 'Num Layers', 'FFN Size', ...
-                          'Reg Type', 'Dropout Prob', 'OptimizerType', 'ActivationFunction'};
-        otherwise
-            lb = [];
-            ub = [];
-            intCon = [];
-            paramNames = {};
+% 收集各代的统计数据
+genStats = [];
+for gen = specificGens
+    if isKey(specificGenData, gen)
+        data = specificGenData(gen);
+        paretoStruct = data.paretoFront;
+        if paretoStruct.numSolutions > 0
+            perf_vals = paretoStruct.performance;
+            stats = [gen, length(perf_vals), min(perf_vals), mean(perf_vals), max(perf_vals)];
+            genStats = [genStats; stats];
+        end
     end
 end
+
+if ~isempty(genStats)
+    subplot(1,3,1);
+    bar(genStats(:,1), genStats(:,2));
+    xlabel('代数');
+    ylabel('Pareto解数量');
+    title('各代Pareto解数量');
+    grid on;
+    
+    subplot(1,3,2);
+    plot(genStats(:,1), genStats(:,3), 'ro-', 'LineWidth', 2, 'DisplayName', '最小RMSE');
+    hold on;
+    plot(genStats(:,1), genStats(:,4), 'bs-', 'LineWidth', 2, 'DisplayName', '平均RMSE');
+    plot(genStats(:,1), genStats(:,5), 'g^-', 'LineWidth', 2, 'DisplayName', '最大RMSE');
+    xlabel('代数');
+    ylabel('RMSE (m/s)');
+    title('各代RMSE统计');
+    legend('Location', 'best');
+    grid on;
+    hold off;
+    
+    subplot(1,3,3);
+    improvement = (genStats(1,3) - genStats(:,3)) ./ genStats(1,3) * 100;
+    bar(genStats(:,1), improvement);
+    xlabel('代数');
+    ylabel('改进百分比 (%)');
+    title('相对第1代的RMSE改进');
+    grid on;
+end
+
+%% 可视化5：3D Pareto前沿可视化（如果有第三个目标）
+% 这里我们用复杂度、RMSE和参数数量作为三个维度
+figure('Name', '3D Pareto Analysis', 'Position', [300, 300, 1000, 700]);
+
+subplot(1,2,1);
+% 使用最后一代的数据
+finalParetoStruct = allParetoFronts{end};
+if finalParetoStruct.numSolutions > 0
+    perf_vals = finalParetoStruct.performance;
+    complexity_vals = finalParetoStruct.complexity;
+    
+    % 计算参数总数作为第三维度（简化计算）
+    param_counts = sum(finalParetoStruct.params, 2); % 简单求和作为参数复杂度指标
+    
+    scatter3(complexity_vals, perf_vals, param_counts, 100, 'filled');
+    xlabel('模型复杂度');
+    ylabel('预测误差 RMSE (m/s)');
+    zlabel('参数总和');
+    title('3D Pareto 分析');
+    grid on;
+    view(45, 30);
+end
+
+subplot(1,2,2);
+% 绘制性能-复杂度的权衡曲线
+if finalParetoStruct.numSolutions > 0
+    perf_vals = finalParetoStruct.performance;
+    complexity_vals = finalParetoStruct.complexity;
+    
+    % 按复杂度排序
+    [sorted_complexity, sort_idx] = sort(complexity_vals);
+    sorted_perf = perf_vals(sort_idx);
+    
+    plot(sorted_complexity, sorted_perf, 'bo-', 'LineWidth', 2, 'MarkerSize', 8);
+    xlabel('模型复杂度');
+    ylabel('预测误差 RMSE (m/s)');
+    title('性能-复杂度权衡曲线');
+    grid on;
+    
+    % 标注几个关键点
+    [min_rmse, min_idx] = min(sorted_perf);
+    [min_complexity, min_comp_idx] = min(sorted_complexity);
+    
+    hold on;
+    plot(sorted_complexity(min_idx), min_rmse, 'ro', 'MarkerSize', 12, 'LineWidth', 3);
+    plot(min_complexity, sorted_perf(min_comp_idx), 'go', 'MarkerSize', 12, 'LineWidth', 3);
+    
+    text(sorted_complexity(min_idx), min_rmse + 0.01, '最小RMSE', 'HorizontalAlignment', 'center');
+    text(min_complexity, sorted_perf(min_comp_idx) + 0.01, '最小复杂度', 'HorizontalAlignment', 'center');
+    hold off;
+end
+
+%% 5. 最终模型训练（选取最小 RMSE 的解）
+[~, bestIdx] = min(performance);
+bestParams = population(bestIdx, :);
+
+% 解析最优超参数
+batchSize = round(bestParams(1));
+learnRate = bestParams(2);
+poolType = round(bestParams(3));
+numFilters1 = round(bestParams(4));
+filterSize1 = round(bestParams(5));
+lstmUnits1 = round(bestParams(6));
+lstmUnits2 = round(bestParams(7));
+regType = round(bestParams(8));
+dropoutProb1 = bestParams(9);
+dropoutProb2 = bestParams(10);
+optimizerType = round(bestParams(11));
+numConvLayers = round(bestParams(12));
+convDropout = bestParams(13);
+activationFunction = round(bestParams(14)); % 激活函数类型
+
+% 构建最终网络（与 evaluateModel 中逻辑一致）
+minSeqLength = min(cellfun(@length, XTrain));
+
+% conv padding 固定为 'same'（兼容 1D conv）
+convPadding = 'same';
+
+layers = [
+    sequenceInputLayer(numFeatures, 'MinLength', minSeqLength)
+    convolution1dLayer(filterSize1, numFilters1, 'Padding', convPadding)
+    batchNormalizationLayer
+];
+
+% 根据激活函数类型添加相应层
+switch activationFunction
+    case 1 % ReLU
+        layers = [layers; reluLayer];
+    case 2 % LeakyReLU
+        layers = [layers; leakyReluLayer(0.3)];
+    case 3 % Tanh
+        layers = [layers; tanhLayer];
+    case 4 % Sigmoid
+        layers = [layers; sigmoidLayer];
+end
+
+if convDropout > 0
+    layers = [layers; dropoutLayer(convDropout)];
+end
+
+if numConvLayers == 2
+    numFilters2 = max(8, round(numFilters1/2));
+    layers = [layers;
+        convolution1dLayer(filterSize1, numFilters2, 'Padding', convPadding)
+        batchNormalizationLayer];
+    
+    % 第二个卷积层的激活函数
+    switch activationFunction
+        case 1 % ReLU
+            layers = [layers; reluLayer];
+        case 2 % LeakyReLU
+            layers = [layers; leakyReluLayer(0.3)];
+        case 3 % Tanh
+            layers = [layers; tanhLayer];
+        case 4 % Sigmoid
+            layers = [layers; sigmoidLayer];
+    end
+    
+    if convDropout > 0
+        layers = [layers; dropoutLayer(convDropout)];
+    end
+    rnInputSize = numFilters2;
+else
+    rnInputSize = numFilters1;
+end
+
+% 池化（使用原 getPoolingLayer）
+layers = [layers; getPoolingLayer(poolType, sequenceLength, filterSize1)];
+
+% RNN：保留原 BiLSTM 结构（与原脚本一致）
+layers = [layers;
+    bilstmLayer(lstmUnits1, 'OutputMode', 'sequence')
+    dropoutLayer(dropoutProb1)
+    bilstmLayer(lstmUnits2, 'OutputMode', 'last')
+    dropoutLayer(dropoutProb2)
+    fullyConnectedLayer(1)
+    regressionLayer];
+
+% 正则化映射（近似）
+if regType == 1 || regType == 3
+    l2reg = 1e-4;
+else
+    l2reg = 0;
+end
+
+% 优化器映射
+if optimizerType == 1
+    solver = 'adam';
+elseif optimizerType == 2
+    solver = 'sgdm';
+else
+    solver = 'rmsprop';
+end
+
+% 训练最终模型
+if strcmp(solver, 'sgdm')
+    options = trainingOptions(solver, ...
+        'MaxEpochs', 80, ...
+        'MiniBatchSize', batchSize, ...
+        'InitialLearnRate', learnRate, ...
+        'L2Regularization', l2reg, ...
+        'Momentum', 0.9, ...
+        'GradientThreshold', 1, ...
+        'ValidationData', {XVal, YVal}, ...
+        'ValidationFrequency', 10, ...
+        'ValidationPatience', 5, ...
+        'Plots', 'training-progress', ...
+        'Verbose', true);
+else
+    options = trainingOptions(solver, ...
+        'MaxEpochs', 80, ...
+        'MiniBatchSize', batchSize, ...
+        'InitialLearnRate', learnRate, ...
+        'L2Regularization', l2reg, ...
+        'GradientThreshold', 1, ...
+        'ValidationData', {XVal, YVal}, ...
+        'ValidationFrequency', 10, ...
+        'ValidationPatience', 5, ...
+        'Plots', 'training-progress', ...
+        'Verbose', true);
+end
+
+try
+    net_opt = trainNetwork(XTrain, YTrain, layers, options);
+
+    % 验证集预测与评估
+    YValPred_opt = predict(net_opt, XVal);
+    YValPred_opt_actual = YValPred_opt * (maxSpeed - minSpeed) + minSpeed;
+
+    mae_val_opt = mean(abs(YVal_actual - YValPred_opt_actual));
+    rmse_val_opt = sqrt(mean((YVal_actual - YValPred_opt_actual).^2));
+    mape_val_opt = mean(abs((YVal_actual - YValPred_opt_actual)./YVal_actual)) * 100;
+    corrMatrix_val_opt = corrcoef(YVal_actual, YValPred_opt_actual);
+    if ~isempty(corrMatrix_val_opt) && size(corrMatrix_val_opt,1) >= 2
+        r_val_opt = corrMatrix_val_opt(1,2);
+    else
+        r_val_opt = 0;
+    end
+    fprintf('优化模型验证集性能: MAE = %.4f (m/s), RMSE = %.4f (m/s), MAPE = %.2f%%, R = %.4f\n', mae_val_opt, rmse_val_opt, mape_val_opt, r_val_opt);
+
+    % 测试集预测与评估
+    YTestPred_opt = predict(net_opt, XTest);
+    YTestPred_opt_actual = YTestPred_opt * (maxSpeed - minSpeed) + minSpeed;
+
+    mae_test_opt = mean(abs(YTest_actual - YTestPred_opt_actual));
+    rmse_test_opt = sqrt(mean((YTest_actual - YTestPred_opt_actual).^2));
+    mape_test_opt = mean(abs((YTest_actual - YTestPred_opt_actual)./YTest_actual)) * 100;
+    corrMatrix_test_opt = corrcoef(YTest_actual, YTestPred_opt_actual);
+    if ~isempty(corrMatrix_test_opt) && size(corrMatrix_test_opt,1) >= 2
+        r_test_opt = corrMatrix_test_opt(1,2);
+    else
+        r_test_opt = 0;
+    end
+    fprintf('优化模型测试集性能: MAE = %.4f (m/s), RMSE = %.4f (m/s), MAPE = %.2f%%, R = %.4f\n', mae_test_opt, rmse_test_opt, mape_test_opt, r_test_opt);
+
+catch e
+    warning('最终模型训练失败：%s', e.message);
+end
+
+%% ===== 新增部分：基准模型对比 =====
+fprintf('开始基准模型对比...\n');
+
+% 基准模型1: 纯LSTM模型
+layers_lstm = [
+    sequenceInputLayer(numFeatures, 'MinLength', minSeqLength)
+    lstmLayer(lstmUnits1, 'OutputMode', 'sequence')
+    dropoutLayer(dropoutProb1)
+    lstmLayer(lstmUnits2, 'OutputMode', 'last')
+    dropoutLayer(dropoutProb2)
+    fullyConnectedLayer(1)
+    regressionLayer];
+
+options_lstm = trainingOptions('adam', ...
+    'MaxEpochs', 80, ...
+    'MiniBatchSize', batchSize, ...
+    'InitialLearnRate', learnRate, ...
+    'L2Regularization', l2reg, ...
+    'GradientThreshold', 1, ...
+    'ValidationData', {XVal, YVal}, ...
+    'ValidationFrequency', 10, ...
+    'ValidationPatience', 5, ...
+    'Plots', 'none', ...
+    'Verbose', true);
+
+try
+    net_lstm = trainNetwork(XTrain, YTrain, layers_lstm, options_lstm);
+    YTestPred_lstm = predict(net_lstm, XTest);
+    YTestPred_lstm_actual = YTestPred_lstm * (maxSpeed - minSpeed) + minSpeed;
+    mae_test_lstm = mean(abs(YTest_actual - YTestPred_lstm_actual));
+    rmse_test_lstm = sqrt(mean((YTest_actual - YTestPred_lstm_actual).^2));
+    mape_test_lstm = mean(abs((YTest_actual - YTestPred_lstm_actual)./YTest_actual)) * 100;
+    corrMatrix_test_lstm = corrcoef(YTest_actual, YTestPred_lstm_actual);
+    r_test_lstm = corrMatrix_test_lstm(1,2);
+    fprintf('LSTM模型测试集性能: MAE = %.4f, RMSE = %.4f, MAPE = %.2f%%, R = %.4f\n', mae_test_lstm, rmse_test_lstm, mape_test_lstm, r_test_lstm);
+catch e
+    warning('LSTM模型训练失败：%s', e.message);
+    mae_test_lstm = NaN; rmse_test_lstm = NaN; mape_test_lstm = NaN; r_test_lstm = NaN;
+end
+
+% 基准模型2: GRU模型
+layers_gru = [
+    sequenceInputLayer(numFeatures, 'MinLength', minSeqLength)
+    gruLayer(lstmUnits1, 'OutputMode', 'sequence')
+    dropoutLayer(dropoutProb1)
+    gruLayer(lstmUnits2, 'OutputMode', 'last')
+    dropoutLayer(dropoutProb2)
+    fullyConnectedLayer(1)
+    regressionLayer];
+
+options_gru = trainingOptions('adam', ...
+    'MaxEpochs', 80, ...
+    'MiniBatchSize', batchSize, ...
+    'InitialLearnRate', learnRate, ...
+    'L2Regularization', l2reg, ...
+    'GradientThreshold', 1, ...
+    'ValidationData', {XVal, YVal}, ...
+    'ValidationFrequency', 10, ...
+    'ValidationPatience', 5, ...
+    'Plots', 'none', ...
+    'Verbose', true);
+
+try
+    net_gru = trainNetwork(XTrain, YTrain, layers_gru, options_gru);
+    YTestPred_gru = predict(net_gru, XTest);
+    YTestPred_gru_actual = YTestPred_gru * (maxSpeed - minSpeed) + minSpeed;
+    mae_test_gru = mean(abs(YTest_actual - YTestPred_gru_actual));
+    rmse_test_gru = sqrt(mean((YTest_actual - YTestPred_gru_actual).^2));
+    mape_test_gru = mean(abs((YTest_actual - YTestPred_gru_actual)./YTest_actual)) * 100;
+    corrMatrix_test_gru = corrcoef(YTest_actual, YTestPred_gru_actual);
+    r_test_gru = corrMatrix_test_gru(1,2);
+    fprintf('GRU模型测试集性能: MAE = %.4f, RMSE = %.4f, MAPE = %.2f%%, R = %.4f\n', mae_test_gru, rmse_test_gru, mape_test_gru, r_test_gru);
+catch e
+    warning('GRU模型训练失败：%s', e.message);
+    mae_test_gru = NaN; rmse_test_gru = NaN; mape_test_gru = NaN; r_test_gru = NaN;
+end
+
+% 基准模型3: 简单CNN模型
+layers_cnn = [
+    sequenceInputLayer(numFeatures, 'MinLength', minSeqLength)
+    convolution1dLayer(filterSize1, numFilters1, 'Padding', 'same')
+    reluLayer
+    maxPooling1dLayer(2, 'Stride', 2, 'Padding', 'same')
+    convolution1dLayer(filterSize1, numFilters1*2, 'Padding', 'same')
+    reluLayer
+    globalAveragePooling1dLayer
+    fullyConnectedLayer(1)
+    regressionLayer];
+
+options_cnn = trainingOptions('adam', ...
+    'MaxEpochs', 80, ...
+    'MiniBatchSize', batchSize, ...
+    'InitialLearnRate', learnRate, ...
+    'L2Regularization', l2reg, ...
+    'GradientThreshold', 1, ...
+    'ValidationData', {XVal, YVal}, ...
+    'ValidationFrequency', 10, ...
+    'ValidationPatience', 5, ...
+    'Plots', 'none', ...
+    'Verbose', true);
+
+try
+    net_cnn = trainNetwork(XTrain, YTrain, layers_cnn, options_cnn);
+    YTestPred_cnn = predict(net_cnn, XTest);
+    YTestPred_cnn_actual = YTestPred_cnn * (maxSpeed - minSpeed) + minSpeed;
+    mae_test_cnn = mean(abs(YTest_actual - YTestPred_cnn_actual));
+    rmse_test_cnn = sqrt(mean((YTest_actual - YTestPred_cnn_actual).^2));
+    mape_test_cnn = mean(abs((YTest_actual - YTestPred_cnn_actual)./YTest_actual)) * 100;
+    corrMatrix_test_cnn = corrcoef(YTest_actual, YTestPred_cnn_actual);
+    r_test_cnn = corrMatrix_test_cnn(1,2);
+    fprintf('CNN模型测试集性能: MAE = %.4f, RMSE = %.4f, MAPE = %.2f%%, R = %.4f\n', mae_test_cnn, rmse_test_cnn, mape_test_cnn, r_test_cnn);
+catch e
+    warning('CNN模型训练失败：%s', e.message);
+    mae_test_cnn = NaN; rmse_test_cnn = NaN; mape_test_cnn = NaN; r_test_cnn = NaN;
+end
+
+%% ===== 最终模型的预测可视化（包含基准模型对比） =====
+figure('Name','Final Model - Comprehensive Prediction Analysis with Benchmarks','Position',[100,100,1400,1000]);
+    
+% 子图1: 验证集预测效果 (优化模型)
+subplot(2,3,1);
+plot(YVal_actual, 'b-', 'LineWidth', 1.5, 'DisplayName', '验证集真实值'); hold on;
+plot(YValPred_opt_actual, 'r--', 'LineWidth', 1.5, 'DisplayName', '优化模型预测');
+xlabel('时间步'); ylabel('风速 (m/s)');
+title(sprintf('验证集预测效果 (RMSE=%.3f)', rmse_val_opt));
+legend('Location','best'); grid on;
+
+% 子图2: 测试集预测效果 (优化模型)
+subplot(2,3,2);
+plot(YTest_actual, 'b-', 'LineWidth', 1.5, 'DisplayName', '测试集真实值'); hold on;
+plot(YTestPred_opt_actual, 'r--', 'LineWidth', 1.5, 'DisplayName', '优化模型预测');
+xlabel('时间步'); ylabel('风速 (m/s)');
+title(sprintf('测试集预测效果 (RMSE=%.3f)', rmse_test_opt));
+legend('Location','best'); grid on;
+
+% 子图3: 测试集残差分析 (优化模型)
+subplot(2,3,3);
+errors_test_opt = YTest_actual - YTestPred_opt_actual;
+histogram(errors_test_opt, 30, 'Normalization', 'probability');
+xlabel('预测误差 (m/s)'); ylabel('概率密度'); 
+title(sprintf('测试集误差分布 (均值=%.3f)', mean(errors_test_opt)));
+grid on;
+
+% 子图4: 测试集散点图 (优化模型)
+subplot(2,3,4);
+scatter(YTest_actual, YTestPred_opt_actual, 50, 'filled', 'MarkerFaceAlpha', 0.6);
+hold on;
+xy = [min(YTest_actual) max(YTest_actual)];
+plot(xy, xy, 'k--', 'LineWidth', 2);
+xlabel('真实值 (m/s)'); ylabel('预测值 (m/s)'); 
+title(sprintf('预测 vs 真实 (R=%.3f)', r_test_opt));
+grid on;
+axis equal; axis tight;
+
+% 子图5: 验证集和测试集性能对比 (优化模型 + 基准)
+subplot(2,3,5);
+metrics = {'MAE', 'RMSE', 'MAPE', 'R'};
+opt_metrics = [mae_test_opt, rmse_test_opt, mape_test_opt, r_test_opt];
+lstm_metrics = [mae_test_lstm, rmse_test_lstm, mape_test_lstm, r_test_lstm];
+gru_metrics = [mae_test_gru, rmse_test_gru, mape_test_gru, r_test_gru];
+cnn_metrics = [mae_test_cnn, rmse_test_cnn, mape_test_cnn, r_test_cnn];
+
+x = categorical(metrics);
+bar(x, [opt_metrics; lstm_metrics; gru_metrics; cnn_metrics]');
+legend({'优化CNN-BiLSTM', 'LSTM', 'GRU', 'CNN'}, 'Location', 'best');
+ylabel('指标值');
+title('不同模型测试集性能对比');
+grid on;
+
+% 子图6: 预测误差时间序列 (优化模型)
+subplot(2,3,6);
+plot(abs(errors_test_opt), 'g-', 'LineWidth', 1);
+xlabel('时间步'); ylabel('绝对误差 (m/s)');
+title('优化模型测试集绝对误差时间序列');
+grid on;
+    
+% 添加误差统计信息
+mean_abs_error = mean(abs(errors_test_opt));
+std_abs_error = std(abs(errors_test_opt));
+yline(mean_abs_error, 'r--', sprintf('均值=%.3f', mean_abs_error), 'LineWidth', 2);
+yline(mean_abs_error + std_abs_error, 'r:', sprintf('+1σ=%.3f', mean_abs_error + std_abs_error));
+yline(mean_abs_error - std_abs_error, 'r:', sprintf('-1σ=%.3f', max(0, mean_abs_error - std_abs_error)));
+
+%% 6. 生成综合报告可视化
+figure('Name', 'Comprehensive Optimization Report', 'Position', [400, 400, 1600, 1200]);
+
+% 子图1: 优化历程总览
+subplot(3,4,1);
+plot(1:maxGenerations, bestPerformanceHistory, 'bo-', 'LineWidth', 2);
+xlabel('代数'); ylabel('最优 RMSE (m/s)');
+title('优化历程 - 最优RMSE');
+grid on;
+
+subplot(3,4,2);
+plot(1:maxGenerations, bestComplexityHistory, 'ro-', 'LineWidth', 2);
+xlabel('代数'); ylabel('对应复杂度');
+title('优化历程 - 对应复杂度');
+grid on;
+
+% 子图3: Pareto解数量变化
+subplot(3,4,3);
+numPareto = zeros(maxGenerations,1);
+for g = 1:maxGenerations
+    paretoStruct = allParetoFronts{g};
+    numPareto(g) = paretoStruct.numSolutions;
+end
+bar(1:maxGenerations, numPareto);
+xlabel('代数'); ylabel('Pareto解数量');
+title('各代Pareto解数量');
+grid on;
+
+% 子图4: 超参数分布（最终代）
+subplot(3,4,4);
+finalParetoStruct = allParetoFronts{end};
+if finalParetoStruct.numSolutions > 0
+    optimizerDist = finalParetoStruct.params(:, 11);
+    histogram(optimizerDist, 'BinEdges', [0.5,1.5,2.5,3.5]);
+    xticks([1 2 3]);
+    xticklabels({'Adam','SGDM','RMSprop'});
+    xlabel('优化器类型'); ylabel('数量');
+    title('最终Pareto解优化器分布');
+    grid on;
+end
+
+% 子图5-8: 关键超参数进化
+keyParams = [1, 2, 6, 7]; % BatchSize, LearnRate, LSTMUnits1, LSTMUnits2
+paramTitles = {'BatchSize进化', 'LearnRate进化', 'LSTM Units1进化', 'LSTM Units2进化'};
+
+for i = 1:4
+    subplot(3,4,4+i);
+    paramIdx = keyParams(i);
+    paramEvolution = bestParamsHistory(:, paramIdx);
+    plot(1:maxGenerations, paramEvolution, 'o-', 'LineWidth', 1.5);
+    xlabel('代数'); ylabel(paramTitles{i});
+    title(paramTitles{i});
+    grid on;
+end
+
+% 子图9: 最终Pareto前沿详细分析
+subplot(3,4,9);
+finalParetoStruct = allParetoFronts{end};
+if finalParetoStruct.numSolutions > 0
+    perf_vals = finalParetoStruct.performance;
+    complexity_vals = finalParetoStruct.complexity;
+    scatter(complexity_vals, perf_vals, 100, 'filled');
+    xlabel('模型复杂度'); ylabel('预测误差 RMSE (m/s)');
+    title(sprintf('最终Pareto前沿 (%d个解)', finalParetoStruct.numSolutions));
+    grid on;
+    
+    % 标注最优解
+    [min_rmse, min_idx] = min(perf_vals);
+    hold on;
+    plot(complexity_vals(min_idx), min_rmse, 'r*', 'MarkerSize', 15, 'LineWidth', 3);
+    text(complexity_vals(min_idx), min_rmse + 0.01, '最优解', 'HorizontalAlignment', 'center');
+    hold off;
+end
+
+% 子图10: 性能改进趋势
+subplot(3,4,10);
+if length(bestPerformanceHistory) > 1
+    improvement = (bestPerformanceHistory(1) - bestPerformanceHistory) ./ bestPerformanceHistory(1) * 100;
+    plot(1:maxGenerations, improvement, 'g-', 'LineWidth', 2);
+    xlabel('代数'); ylabel('改进百分比 (%)');
+    title('相对初始代的性能改进');
+    grid on;
+end
+
+% 子图11: 复杂度vs性能权衡分析
+subplot(3,4,11);
+finalParetoStruct = allParetoFronts{end};
+if finalParetoStruct.numSolutions > 0
+    perf_vals = finalParetoStruct.performance;
+    complexity_vals = finalParetoStruct.complexity;
+    
+    % 计算权衡比率
+    normalized_perf = (perf_vals - min(perf_vals)) / (max(perf_vals) - min(perf_vals));
+    normalized_comp = (complexity_vals - min(complexity_vals)) / (max(complexity_vals) - min(complexity_vals));
+    tradeoff_ratio = normalized_perf ./ (normalized_comp + eps);
+    
+    [sorted_ratio, sort_idx] = sort(tradeoff_ratio);
+    plot(1:length(sorted_ratio), sorted_ratio, 'bo-', 'LineWidth', 1.5);
+    xlabel('解的排序'); ylabel('权衡比率');
+    title('性能-复杂度权衡分析');
+    grid on;
+end
+
+% 子图12: 最优解的超参数雷达图
+subplot(3,4,12);
+finalParetoStruct = allParetoFronts{end};
+if finalParetoStruct.numSolutions > 0
+    [~, bestIdx] = min(finalParetoStruct.performance);
+    bestSolution = finalParetoStruct.params(bestIdx, :);
+    
+    % 归一化超参数到[0,1]范围用于雷达图
+    normalizedParams = (bestSolution - lb) ./ (ub - lb);
+    
+    % 选择几个关键参数绘制雷达图
+    keyParamIdx = [1, 2, 4, 6, 7, 9, 10, 11, 14];
+    keyParamNames = {'Batch', 'LR', 'Filters', 'LSTM1', 'LSTM2', 'Drop1', 'Drop2', 'Opt', 'Act'};
+    keyValues = normalizedParams(keyParamIdx);
+    
+    % 简化的雷达图（极坐标）
+    angles = linspace(0, 2*pi, length(keyValues)+1);
+    values = [keyValues, keyValues(1)]; % 闭合
+    
+    polar(angles, values, 'ro-');
+    title('最优解超参数分布');
+end
+%% 新增可视化：多代Pareto前沿叠加对比
+figure('Name', 'Multiple Generations Pareto Front Comparison', 'Position', [350, 350, 1000, 700]);
+hold on;
+
+% 使用不同颜色和标记区分各代
+colors = {'r', 'g', 'b', 'm'};
+markers = {'o', 's', '^', 'd'};
+markerSizes = [80, 70, 60, 50];
+
+for i = 1:length(specificGens)
+    gen = specificGens(i);
+    if isKey(specificGenData, gen)
+        data = specificGenData(gen);
+        paretoStruct = data.paretoFront;
+        if paretoStruct.numSolutions > 0
+            % 提取当前代的Pareto前沿数据
+            perf_vals = paretoStruct.performance;
+            complexity_vals = paretoStruct.complexity;
+            
+            % 添加微小扰动避免点完全重叠
+            jitter = 1e-4 * randn(length(perf_vals), 2);
+            perturbed_complexity = complexity_vals + jitter(:,1);
+            perturbed_perf = perf_vals + jitter(:,2);
+            
+            % 绘制当前代的Pareto点
+            scatter(perturbed_complexity, perturbed_perf, markerSizes(i), colors{i}, ...
+                   'filled', markers{i}, 'DisplayName', sprintf('第%d代', gen));
+        end
+    end
+end
+
+xlabel('模型复杂度（越小越好）');
+ylabel('预测误差 RMSE (m/s)（越小越好）');
+title('不同代数Pareto前沿对比');
+legend('Location', 'best');
+grid on;
+hold off;
+
+% 更新摘要报告中的图表列表
+fprintf('8. 多代Pareto前沿叠加对比图\n');
+
+
+%% 7. 打印优化后的超参数（扩展后的参数列表）
+paramNames = {'Batch Size', 'Learn Rate', 'Pool Type', ...
+              'Num Filters1', 'Filter Size1', 'LSTM Units1', ...
+              'LSTM Units2', 'Reg Type', 'Dropout Prob1', 'Dropout Prob2', ...
+              'OptimizerType', 'NumConvLayers', 'ConvDropout', 'ActivationFunction'};
+
+fprintf('\n=== 最终优化的超参数 ===\n');
+for i = 1:length(bestParams)
+    if ismember(i, intCon)
+        fprintf('%s: %d\n', paramNames{i}, round(bestParams(i)));
+    else
+        fprintf('%s: %.6f\n', paramNames{i}, bestParams(i));
+    end
+end
+
+%% 8. 生成优化摘要报告
+fprintf('\n=== NSGA-II 优化摘要报告 ===\n');
+fprintf('总进化代数: %d\n', maxGenerations);
+fprintf('种群大小: %d\n', populationSize);
+fprintf('最终Pareto解数量: %d\n', finalParetoStruct.numSolutions);
+fprintf('初始最优RMSE: %.4f (m/s)\n', bestPerformanceHistory(1));
+fprintf('最终最优RMSE: %.4f (m/s)\n', bestPerformanceHistory(end));
+fprintf('性能改进: %.2f%%\n', (bestPerformanceHistory(1) - bestPerformanceHistory(end)) / bestPerformanceHistory(1) * 100);
+
+if exist('rmse_test_opt', 'var')
+    fprintf('最终模型测试集RMSE: %.4f (m/s)\n', rmse_test_opt);
+    fprintf('最终模型测试集MAE: %.4f (m/s)\n', mae_test_opt);
+    fprintf('最终模型测试集MAPE: %.2f%%\n', mape_test_opt);
+    fprintf('最终模型测试集相关系数: %.4f\n', r_test_opt);
+end
+
+fprintf('\n可视化图表已生成，包括:\n');
+fprintf('1. 特定代数(1,5,10,20)Pareto前沿对比\n');
+fprintf('2. Pareto前沿进化动画帧\n');
+fprintf('3. 超参数分布分析\n');
+fprintf('4. 性能指标对比\n');
+fprintf('5. 3D Pareto分析\n');
+fprintf('6. 最终模型预测分析（包含基准对比）\n');
+fprintf('7. 综合优化报告\n');
+
+fprintf('\n优化完成！所有结果已保存至 nsga2_optimization_results_extended.mat\n');
+
+%% ================== 局部辅助函数 ================== %% 
 
 %% 初始化种群
 function population = initializePopulation(populationSize, lb, ub, intCon)
@@ -1013,7 +1019,7 @@ function population = initializePopulation(populationSize, lb, ub, intCon)
 end
 
 %% 评估种群
-function [performance, complexity, rmse, mae, mape, r] = evaluatePopulation(population, XTrain, YTrain, XVal, YVal, minSpeed, maxSpeed, sequenceLength, numFeatures, modelType)
+function [performance, complexity, rmse, mae, mape, r] = evaluatePopulation(population, XTrain, YTrain, XVal, YVal, minSpeed, maxSpeed, sequenceLength, numFeatures)
     popSize = size(population, 1);
     performance = zeros(popSize, 1);
     complexity = zeros(popSize, 1);
@@ -1023,154 +1029,14 @@ function [performance, complexity, rmse, mae, mape, r] = evaluatePopulation(popu
     r = zeros(popSize, 1);
 
     for i = 1:popSize
-        [performance(i), complexity(i), rmse(i), mae(i), mape(i), r(i)] = evaluateModel(population(i, :), XTrain, YTrain, XVal, YVal, ...
-            minSpeed, maxSpeed, sequenceLength, numFeatures, modelType);
+        [performance(i), complexity(i), rmse(i), mae(i), mape(i), r(i)] = evaluateModel(population(i, :), XTrain, YTrain, XVal, YVal, minSpeed, maxSpeed, sequenceLength, numFeatures);
     end
 end
 
 %% evaluateModel：解码超参数、建立网络、训练、评估
-function [performance, complexity, rmse, mae, mape, r] = evaluateModel(x, XTrain, YTrain, XVal, YVal, minSpeed, maxSpeed, sequenceLength, numFeatures, modelType)
-    % 使用全局调试开关
-    global GLOBAL_VERBOSE;
-
+function [performance, complexity, rmse, mae, mape, r] = evaluateModel(x, XTrain, YTrain, XVal, YVal, minSpeed, maxSpeed, sequenceLength, numFeatures)
     performance = 1e6; complexity = 1e6; rmse = 1e6; mae = 1e6; mape = 1e6; r = -1;
-    
-    % 根据模型类型解码超参数并构建网络
-    switch modelType
-        case 'CNN-LSTM'
-            [valid, layers, complexity] = buildCNNLSTMModel(x, sequenceLength, numFeatures);
-        case 'CNN'
-            [valid, layers, complexity] = buildCNNModel(x, sequenceLength, numFeatures);
-        case 'LSTM'
-            [valid, layers, complexity] = buildLSTMModel(x, sequenceLength, numFeatures);
-        case 'GRU'
-            [valid, layers, complexity] = buildGRUModel(x, sequenceLength, numFeatures);
-        case 'Transformer'
-            [valid, layers, complexity] = buildTransformerModel(x, sequenceLength, numFeatures);
-        otherwise
-            error('未知模型类型: %s', modelType);
-    end
-    
-    % 参数无效则返回
-    if ~valid
-        return;
-    end
-    
-    % 最短序列长度
-    minSeqLength = min(cellfun(@length, XTrain));
-    % 将第一层确保为 sequenceInputLayer（替换以匹配 MinLength）
-    layers(1) = sequenceInputLayer(numFeatures, 'MinLength', minSeqLength, 'Name', 'input_replaced');
-    
-    % 正则化和优化器参数（默认位置）
-    % 特殊处理不同模型的参数位置
-    switch modelType
-        case 'CNN-LSTM'
-            regType = round(x(8));
-            optimizerType = round(x(11));
-            batchSize = max(8, round(x(1)));
-            learnRate = x(2);
-        case 'CNN'
-            regType = round(x(9));
-            optimizerType = round(x(11));
-            batchSize = max(8, round(x(1)));
-            learnRate = x(2);
-        case 'LSTM'
-            regType = round(x(6));
-            optimizerType = round(x(9));
-            batchSize = max(8, round(x(1)));
-            learnRate = x(2);
-        case 'GRU'
-            regType = round(x(6));
-            optimizerType = round(x(9));
-            batchSize = max(8, round(x(1)));
-            learnRate = x(2);
-        case 'Transformer'
-            regType = round(x(7));
-            optimizerType = round(x(9));
-            batchSize = max(8, round(x(1)));
-            learnRate = x(2);
-    end
-    
-    % 正则化映射
-    if regType == 1 || regType == 3
-        l2reg = 1e-4;
-    else
-        l2reg = 0;
-    end
-    
-    % 优化器映射
-    if optimizerType == 1
-        solver = 'adam';
-    elseif optimizerType == 2
-        solver = 'sgdm';
-    else
-        solver = 'rmsprop';
-    end
-    
-    % trainingOptions（NSGA-II 中不显示训练过程，尽量简洁）
-    try
-        options = trainingOptions(solver, ...
-            'MaxEpochs', 30, ...
-            'MiniBatchSize', batchSize, ...
-            'InitialLearnRate', learnRate, ...
-            'L2Regularization', l2reg, ...
-            'GradientThreshold', 1, ...
-            'ValidationData', {XVal, YVal}, ...
-            'ValidationFrequency', 10, ...
-            'ValidationPatience', 5, ...
-            'Plots', 'none', ...
-            'Verbose', false, ...
-            'Shuffle', 'every-epoch');
-        
-        % 训练并预测
-        net = trainNetwork(XTrain, YTrain, layers, options);
-        YPred = predict(net, XVal);
-        
-        % 反归一化
-        YVal_actual_local = YVal * (maxSpeed - minSpeed) + minSpeed;
-        YPred_actual = YPred * (maxSpeed - minSpeed) + minSpeed;
-        
-        % 性能指标
-        mae = mean(abs(YVal_actual_local - YPred_actual));
-        rmse = sqrt(mean((YVal_actual_local - YPred_actual).^2));
-        % 避免 division by zero
-        if all(YVal_actual_local == 0)
-            mape = NaN;
-        else
-            mape = mean(abs((YVal_actual_local - YPred_actual)./YVal_actual_local)) * 100;
-        end
-        corrMatrix = corrcoef(YVal_actual_local, YPred_actual);
-        if ~isempty(corrMatrix) && size(corrMatrix,1) >= 2
-            r = corrMatrix(1,2);
-        else
-            r = 0;
-        end
-        performance = rmse;
-        
-        % RMSE 过高惩罚
-        if rmse > 5
-            performance = performance + 500;
-            complexity = complexity + 500;
-        end
-    catch e
-        if GLOBAL_VERBOSE
-            warning('模型训练失败：%s', e.message);
-        end
-        performance = 1e6; complexity = 1e6; rmse = 1e6; mae = 1e6; mape = 1e6; r = -1;
-    end
-    
-    % 在 NSGA 主循环中尽量少打印，但可用全局开关打开调试信息
-    if GLOBAL_VERBOSE
-        fprintf('%s 模型性能指标: RMSE=%.4f (m/s), 复杂度=%d\n', modelType, rmse, complexity);
-    end
-end
-
-%% 构建 CNN-LSTM 模型
-function [valid, layers, complexity] = buildCNNLSTMModel(x, sequenceLength, numFeatures)
-    valid = true;
-    complexity = 0;
-    
-    % 解码超参数
+    % 解码（同上顺序）
     batchSize = round(x(1));
     learnRate = x(2);
     poolType = round(x(3));
@@ -1184,8 +1050,8 @@ function [valid, layers, complexity] = buildCNNLSTMModel(x, sequenceLength, numF
     optimizerType = round(x(11));
     numConvLayers = round(x(12));
     convDropout = x(13);
-    activationFunction = round(x(14));
-    
+    activationFunction = round(x(14)); % 激活函数类型
+
     % 参数检验
     if batchSize < 8 || batchSize > 2048 || ...
        learnRate < 1e-6 || learnRate > 5e-2 || ...
@@ -1201,45 +1067,68 @@ function [valid, layers, complexity] = buildCNNLSTMModel(x, sequenceLength, numF
        ~ismember(numConvLayers, [1,2]) || ...
        convDropout < 0 || convDropout > 0.6 || ...
        ~ismember(activationFunction, [1, 2, 3, 4])
-        valid = false;
         return;
     end
-    
+
+    % 最短序列长度
+    minSeqLength = min(cellfun(@length, XTrain));
+
+    % 为 1D conv 设定合法 padding（避免 'valid' 字符串引起报错）
+    convPadding = 'same'; % 选择 'same' 以保证兼容性
+
     % 构建网络
     layers = [
-        sequenceInputLayer(numFeatures, 'Name', 'input')
-        convolution1dLayer(filterSize1, numFilters1, 'Padding', 'same')
+        sequenceInputLayer(numFeatures, 'MinLength', minSeqLength)
+        convolution1dLayer(filterSize1, numFilters1, 'Padding', convPadding)
         batchNormalizationLayer
     ];
     
     % 添加激活函数层
-    layers = [layers; addActivationLayer([], activationFunction)];
-    
+    switch activationFunction
+        case 1 % ReLU
+            layers = [layers; reluLayer];
+        case 2 % LeakyReLU
+            layers = [layers; leakyReluLayer(0.3)];
+        case 3 % Tanh
+            layers = [layers; tanhLayer];
+        case 4 % Sigmoid
+            layers = [layers; sigmoidLayer];
+    end
+
     if convDropout > 0
         layers = [layers; dropoutLayer(convDropout)];
     end
-    
+
     if numConvLayers == 2
         numFilters2 = max(8, round(numFilters1 / 2));
         layers = [layers;
-            convolution1dLayer(filterSize1, numFilters2, 'Padding', 'same')
+            convolution1dLayer(filterSize1, numFilters2, 'Padding', convPadding)
             batchNormalizationLayer];
         
         % 第二个卷积层的激活函数
-        layers = [layers; addActivationLayer([], activationFunction)];
+        switch activationFunction
+            case 1 % ReLU
+                layers = [layers; reluLayer];
+            case 2 % LeakyReLU
+                layers = [layers; leakyReluLayer(0.01)];
+            case 3 % Tanh
+                layers = [layers; tanhLayer];
+            case 4 % Sigmoid
+                layers = [layers; sigmoidLayer];
+        end
         
         if convDropout > 0
             layers = [layers; dropoutLayer(convDropout)];
         end
-        rnn_input = numFilters2;
+        rnnInputSize = numFilters2;
     else
-        rnn_input = numFilters1;
+        rnnInputSize = numFilters1;
     end
-    
-    % 池化
+
+    % 池化（使用原来的 getPoolingLayer）
     layers = [layers; getPoolingLayer(poolType, sequenceLength, filterSize1)];
-    
-    % RNN：保留 BiLSTM 结构
+
+    % RNN：保留 BiLSTM 原始结构
     layers = [layers;
         bilstmLayer(lstmUnits1, 'OutputMode', 'sequence')
         dropoutLayer(dropoutProb1)
@@ -1247,379 +1136,120 @@ function [valid, layers, complexity] = buildCNNLSTMModel(x, sequenceLength, numF
         dropoutLayer(dropoutProb2)
         fullyConnectedLayer(1)
         regressionLayer];
-    
-    % 计算复杂度（粗略估计）
-    conv1_weights = filterSize1 * numFeatures * numFilters1;
-    conv1_bias = numFilters1;
-    complexity = complexity + conv1_weights + conv1_bias;
-    
-    if numConvLayers == 2
-        numFilters2 = max(8, round(numFilters1 / 2));
-        conv2_weights = filterSize1 * numFilters1 * numFilters2;
-        conv2_bias = numFilters2;
-        complexity = complexity + conv2_weights + conv2_bias;
-        rnn_input = numFilters2;
+
+    % 正则化映射（近似）
+    if regType == 1
+        l2reg = 1e-4;
+    elseif regType == 2
+        l2reg = 0;
+    elseif regType == 3
+        l2reg = 1e-4;
     else
-        rnn_input = numFilters1;
-    end
-    
-    forwardParams1 = 4 * lstmUnits1 * (rnn_input + lstmUnits1) + 4 * lstmUnits1;
-    backwardParams1 = forwardParams1;
-    complexity = complexity + forwardParams1 + backwardParams1;
-    
-    inputSize2 = 2 * lstmUnits1;
-    forwardParams2 = 4 * lstmUnits2 * (inputSize2 + lstmUnits2) + 4 * lstmUnits2;
-    backwardParams2 = forwardParams2;
-    complexity = complexity + forwardParams2 + backwardParams2;
-    
-    fcInput = 2 * lstmUnits2;
-    fcWeights = fcInput * 1;
-    fcBias = 1;
-    complexity = complexity + fcWeights + fcBias;
-end
-
-%% 构建 CNN 模型
-function [valid, layers, complexity] = buildCNNModel(x, sequenceLength, numFeatures)
-    valid = true;
-    complexity = 0;
-    
-    % 解码超参数
-    batchSize = round(x(1));
-    learnRate = x(2);
-    poolType = round(x(3));
-    numFilters1 = round(x(4));
-    filterSize1 = round(x(5));
-    numFilters2 = round(x(6));
-    filterSize2 = round(x(7));
-    numFCUnits = round(x(8));
-    regType = round(x(9));
-    dropoutProb = x(10);
-    optimizerType = round(x(11));
-    numConvLayers = round(x(12));
-    activationFunction = round(x(13));
-    
-    % 参数检验
-    if batchSize < 8 || batchSize > 2048 || ...
-       learnRate < 1e-6 || learnRate > 5e-2 || ...
-       ~ismember(poolType, [1,2]) || ...
-       numFilters1 < 8 || numFilters1 > 512 || ...
-       filterSize1 < 2 || filterSize1 > 5 || ...
-       numFilters2 < 8 || numFilters2 > 512 || ...
-       filterSize2 < 2 || filterSize2 > 5 || ...
-       numFCUnits < 16 || numFCUnits > 512 || ...
-       ~ismember(regType, [1,2,3]) || ...
-       dropoutProb < 0 || dropoutProb > 0.6 || ...
-       ~ismember(optimizerType, [1,2,3]) || ...
-       numConvLayers < 1 || numConvLayers > 3 || ...
-       ~ismember(activationFunction, [1, 2, 3, 4])
-        valid = false;
-        return;
-    end
-    
-    % 构建网络
-    layers = [sequenceInputLayer(numFeatures, 'Name', 'input')];
-    prevFilters = numFeatures;
-    
-    % 添加卷积层
-    for i = 1:numConvLayers
-        if i == 1
-            filters = numFilters1;
-            filterSize = filterSize1;
-        elseif i == 2
-            filters = numFilters2;
-            filterSize = filterSize2;
-        else
-            filters = max(8, round(numFilters2 / 2));
-            filterSize = filterSize2;
-        end
-        
-        layers = [layers;
-            convolution1dLayer(filterSize, filters, 'Padding', 'same')
-            batchNormalizationLayer];
-        
-        layers = [layers; addActivationLayer([], activationFunction)];
-        
-        if i < numConvLayers
-            layers = [layers; getPoolingLayer(poolType, sequenceLength, filterSize)];
-        end
-        
-        if dropoutProb > 0
-            layers = [layers; dropoutLayer(dropoutProb)];
-        end
-        
-        conv_weights = filterSize * prevFilters * filters;
-        conv_bias = filters;
-        complexity = complexity + conv_weights + conv_bias;
-        prevFilters = filters;
-    end
-    
-    layers = [layers;
-        globalAveragePooling1dLayer
-        fullyConnectedLayer(numFCUnits)
-        addActivationLayer([], activationFunction)
-        dropoutLayer(dropoutProb)
-        fullyConnectedLayer(1)
-        regressionLayer];
-    
-    fc1_weights = prevFilters * numFCUnits;
-    fc1_bias = numFCUnits;
-    fc2_weights = numFCUnits * 1;
-    fc2_bias = 1;
-    complexity = complexity + fc1_weights + fc1_bias + fc2_weights + fc2_bias;
-end
-
-%% 构建 LSTM 模型
-function [valid, layers, complexity] = buildLSTMModel(x, sequenceLength, numFeatures)
-    valid = true;
-    complexity = 0;
-    
-    % 解码超参数
-    batchSize = round(x(1));
-    learnRate = x(2);
-    lstmUnits1 = round(x(3));
-    lstmUnits2 = round(x(4));
-    lstmUnits3 = round(x(5));
-    regType = round(x(6));
-    dropoutProb1 = x(7);
-    dropoutProb2 = x(8);
-    optimizerType = round(x(9));
-    numLSTMLayers = round(x(10));
-    activationFunction = round(x(11));
-    
-    % 参数检验
-    if batchSize < 8 || batchSize > 2048 || ...
-       learnRate < 1e-6 || learnRate > 5e-2 || ...
-       lstmUnits1 < 8 || lstmUnits1 > 512 || ...
-       (numLSTMLayers >= 2 && (lstmUnits2 < 8 || lstmUnits2 > 512)) || ...
-       (numLSTMLayers >= 3 && (lstmUnits3 < 8 || lstmUnits3 > 512)) || ...
-       ~ismember(regType, [1,2,3]) || ...
-       dropoutProb1 < 0 || dropoutProb1 > 0.6 || ...
-       dropoutProb2 < 0 || dropoutProb2 > 0.6 || ...
-       ~ismember(optimizerType, [1,2,3]) || ...
-       numLSTMLayers < 1 || numLSTMLayers > 3 || ...
-       ~ismember(activationFunction, [1, 2, 3, 4])
-        valid = false;
-        return;
-    end
-    
-    % 构建网络
-    layers = [sequenceInputLayer(numFeatures, 'Name', 'input')];
-    prevUnits = numFeatures;
-    
-    % 添加LSTM层
-    for i = 1:numLSTMLayers
-        if i == numLSTMLayers
-            outputMode = 'last';
-        else
-            outputMode = 'sequence';
-        end
-        
-        if i == 1
-            units = lstmUnits1;
-        elseif i == 2
-            units = lstmUnits2;
-        else
-            units = lstmUnits3;
-        end
-        
-        layers = [layers;
-            lstmLayer(units, 'OutputMode', outputMode)];
-        
-        if i < numLSTMLayers && dropoutProb1 > 0
-            layers = [layers; dropoutLayer(dropoutProb1)];
-        end
-        
-        lstmParams = 4 * units * (prevUnits + units) + 4 * units;
-        complexity = complexity + lstmParams;
-        prevUnits = units;
-    end
-    
-    if dropoutProb2 > 0
-        layers = [layers; dropoutLayer(dropoutProb2)];
-    end
-    layers = [layers;
-        fullyConnectedLayer(1)
-        regressionLayer];
-    
-    fcWeights = prevUnits * 1;
-    fcBias = 1;
-    complexity = complexity + fcWeights + fcBias;
-end
-
-%% 构建 GRU 模型
-function [valid, layers, complexity] = buildGRUModel(x, sequenceLength, numFeatures)
-    valid = true;
-    complexity = 0;
-    
-    % 解码超参数
-    batchSize = round(x(1));
-    learnRate = x(2);
-    gruUnits1 = round(x(3));
-    gruUnits2 = round(x(4));
-    gruUnits3 = round(x(5));
-    regType = round(x(6));
-    dropoutProb1 = x(7);
-    dropoutProb2 = x(8);
-    optimizerType = round(x(9));
-    numGRULayers = round(x(10));
-    activationFunction = round(x(11));
-    
-    % 参数检验
-    if batchSize < 8 || batchSize > 2048 || ...
-       learnRate < 1e-6 || learnRate > 5e-2 || ...
-       gruUnits1 < 8 || gruUnits1 > 512 || ...
-       (numGRULayers >= 2 && (gruUnits2 < 8 || gruUnits2 > 512)) || ...
-       (numGRULayers >= 3 && (gruUnits3 < 8 || gruUnits3 > 512)) || ...
-       ~ismember(regType, [1,2,3]) || ...
-       dropoutProb1 < 0 || dropoutProb1 > 0.6 || ...
-       dropoutProb2 < 0 || dropoutProb2 > 0.6 || ...
-       ~ismember(optimizerType, [1,2,3]) || ...
-       numGRULayers < 1 || numGRULayers > 3 || ...
-       ~ismember(activationFunction, [1, 2, 3, 4])
-        valid = false;
-        return;
-    end
-    
-    layers = [sequenceInputLayer(numFeatures, 'Name', 'input')];
-    prevUnits = numFeatures;
-    
-    for i = 1:numGRULayers
-        if i == numGRULayers
-            outputMode = 'last';
-        else
-            outputMode = 'sequence';
-        end
-        
-        if i == 1
-            units = gruUnits1;
-        elseif i == 2
-            units = gruUnits2;
-        else
-            units = gruUnits3;
-        end
-        
-        layers = [layers;
-            gruLayer(units, 'OutputMode', outputMode)];
-        
-        if i < numGRULayers && dropoutProb1 > 0
-            layers = [layers; dropoutLayer(dropoutProb1)];
-        end
-        
-        gruParams = 3 * units * (prevUnits + units) + 3 * units;
-        complexity = complexity + gruParams;
-        prevUnits = units;
-    end
-    
-    if dropoutProb2 > 0
-        layers = [layers; dropoutLayer(dropoutProb2)];
-    end
-    layers = [layers;
-        fullyConnectedLayer(1)
-        regressionLayer];
-    
-    fcWeights = prevUnits * 1;
-    fcBias = 1;
-    complexity = complexity + fcWeights + fcBias;
-end
-
-%% 构建 Transformer 模型（兼容性处理）
-function [valid, layers, complexity] = buildTransformerModel(x, sequenceLength, numFeatures)
-    valid = true;
-    complexity = 0;
-    layers = [];
-
-    batchSize = round(x(1));
-    learnRate = x(2);
-    numHeads = round(x(3));
-    hiddenSize = round(x(4));
-    numLayers = round(x(5));
-    ffnSize = round(x(6));
-    regType = round(x(7));
-    dropoutProb = x(8);
-    optimizerType = round(x(9));
-    activationFunction = round(x(10));
-
-    if batchSize < 8 || batchSize > 2048 || ...
-       learnRate < 1e-6 || learnRate > 5e-2 || ...
-       numHeads < 1 || numHeads > 16 || ...
-       hiddenSize < 16 || hiddenSize > 1024 || ...
-       numLayers < 1 || numLayers > 6 || ...
-       ffnSize < 32 || ffnSize > 2048 || ...
-       ~ismember(regType, [1,2,3]) || ...
-       dropoutProb < 0 || dropoutProb > 0.7 || ...
-       ~ismember(optimizerType, [1,2,3]) || ...
-       ~ismember(activationFunction, [1, 2, 3, 4])
-        valid = false;
-        layers = [];
-        return;
+        l2reg = 0;
     end
 
-    layers = [sequenceInputLayer(numFeatures, 'Name', 'input')];
-
-    if numFeatures ~= hiddenSize
-        layers = [layers;
-            fullyConnectedLayer(hiddenSize, 'Name', 'input_proj');
-            addActivationLayer([], activationFunction)];
-        projWeights = numFeatures * hiddenSize;
-        projBias = hiddenSize;
-        complexity = complexity + projWeights + projBias;
-    end
-
-    transformerAvailable = true;
-    for i = 1:numLayers
-        try
-            encLayer = transformerEncoderLayer(hiddenSize, numHeads, 'Name', sprintf('transformer_encoder_%d', i));
-            layers = [layers; encLayer];
-            attentionParamsPerLayer = 4 * hiddenSize * hiddenSize + 4 * hiddenSize;
-            ffnParamsPerLayer = hiddenSize * ffnSize + ffnSize + ffnSize * hiddenSize + hiddenSize;
-            complexity = complexity + attentionParamsPerLayer + ffnParamsPerLayer;
-        catch
-            transformerAvailable = false;
-            break;
-        end
-    end
-
-    if ~transformerAvailable
-        warning('当前环境不支持 transformerEncoderLayer，退化为 LSTM 结构。');
-        layers = [sequenceInputLayer(numFeatures, 'Name', 'input')];
-        layers = [layers;
-            lstmLayer(hiddenSize, 'OutputMode', 'last');
-            fullyConnectedLayer(1);
-            regressionLayer];
-        complexity = complexity + (4 * hiddenSize * (numFeatures + hiddenSize) + 4*hiddenSize) + hiddenSize + 1;
-        return;
-    end
-
-    layers = [layers;
-        globalAveragePooling1dLayer('Name', 'global_avg_pool')
-        fullyConnectedLayer(1, 'Name', 'output_fc')
-        regressionLayer('Name', 'regression_output')];
-
-    fcWeights = hiddenSize * 1;
-    fcBias = 1;
-    complexity = complexity + fcWeights + fcBias;
-end
-
-%% 添加激活函数层
-function layers = addActivationLayer(layers, activationType)
-    switch activationType
-        case 1 % ReLU
-            layer = reluLayer;
-        case 2 % LeakyReLU
-            layer = leakyReluLayer(0.3);
-        case 3 % Tanh
-            layer = tanhLayer;
-        case 4 % Sigmoid
-            layer = sigmoidLayer;
-        otherwise
-            layer = reluLayer;
-    end
-    
-    if isempty(layers)
-        layers = layer;
+    % 优化器映射
+    if optimizerType == 1
+        solver = 'adam';
+    elseif optimizerType == 2
+        solver = 'sgdm';
     else
-        layers = [layers; layer];
+        solver = 'rmsprop';
     end
+
+    % trainingOptions
+    try
+        if strcmp(solver, 'sgdm')
+            options = trainingOptions(solver, ...
+                'MaxEpochs', 30, ...
+                'MiniBatchSize', batchSize, ...
+                'InitialLearnRate', learnRate, ...
+                'L2Regularization', l2reg, ...
+                'Momentum', 0.9, ...
+                'GradientThreshold', 1, ...
+                'ValidationData', {XVal, YVal}, ...
+                'ValidationFrequency', 10, ...
+                'ValidationPatience', 5, ...
+                'Plots', 'none', ...
+                'Verbose', false, ...
+                'Shuffle', 'every-epoch');
+        else
+            options = trainingOptions(solver, ...
+                'MaxEpochs', 30, ...
+                'MiniBatchSize', batchSize, ...
+                'InitialLearnRate', learnRate, ...
+                'L2Regularization', l2reg, ...
+                'GradientThreshold', 1, ...
+                'ValidationData', {XVal, YVal}, ...
+                'ValidationFrequency', 10, ...
+                'ValidationPatience', 5, ...
+                'Plots', 'none', ...
+                'Verbose', false, ...
+                'Shuffle', 'every-epoch');
+        end
+
+        % 训练并预测
+        net = trainNetwork(XTrain, YTrain, layers, options);
+        YPred = predict(net, XVal);
+
+        % 反归一化
+        YVal_actual = YVal * (maxSpeed - minSpeed) + minSpeed;
+        YPred_actual = YPred * (maxSpeed - minSpeed) + minSpeed;
+
+        % 性能指标
+        mae = mean(abs(YVal_actual - YPred_actual));
+        rmse = sqrt(mean((YVal_actual - YPred_actual).^2));
+        mape = mean(abs((YVal_actual - YPred_actual)./YVal_actual)) * 100;
+        corrMatrix = corrcoef(YVal_actual, YPred_actual);
+        if ~isempty(corrMatrix) && size(corrMatrix,1) >= 2
+            r = corrMatrix(1,2);
+        else
+            r = 0;
+        end
+        performance = rmse;
+
+        % 复杂度计算：卷积 + RNN + 全连接
+        complexity = 0;
+        % conv1 parameters: filterSize * inChannels * outChannels + bias
+        conv1_weights = filterSize1 * numFeatures * numFilters1;
+        conv1_bias = numFilters1;
+        complexity = complexity + conv1_weights + conv1_bias;
+        if numConvLayers == 2
+            numFilters2 = max(8, round(numFilters1 / 2));
+            conv2_weights = filterSize1 * numFilters1 * numFilters2;
+            conv2_bias = numFilters2;
+            complexity = complexity + conv2_weights + conv2_bias;
+            rnn_input = numFilters2;
+        else
+            rnn_input = numFilters1;
+        end
+
+        % BiLSTM 参数（保守估算）
+        forwardParams1 = 4 * lstmUnits1 * (rnn_input + lstmUnits1) + 4 * lstmUnits1;
+        backwardParams1 = forwardParams1;
+        complexity = complexity + forwardParams1 + backwardParams1;
+        inputSize2 = 2 * lstmUnits1;
+        forwardParams2 = 4 * lstmUnits2 * (inputSize2 + lstmUnits2) + 4 * lstmUnits2;
+        backwardParams2 = forwardParams2;
+        complexity = complexity + forwardParams2 + backwardParams2;
+
+        % 全连接层
+        fcInput = 2 * lstmUnits2;
+        fcWeights = fcInput * 1;
+        fcBias = 1;
+        complexity = complexity + fcWeights + fcBias;
+
+        % RMSE 过高惩罚
+        if rmse > 5
+            performance = performance + 500;
+            complexity = complexity + 500;
+        end
+    catch e
+        warning('模型训练失败：%s', e.message);
+        performance = 1e6; complexity = 1e6; rmse = 1e6; mae = 1e6; mape = 1e6; r = -1;
+    end
+
+    fprintf('性能指标: RMSE=%.4f (m/s), 复杂度=%d\n', rmse, complexity);
 end
 
 %% 快速非支配排序
@@ -1789,11 +1419,12 @@ function [newPopulation, newPerformance, newComplexity] = environmentalSelection
     end
 end
 
-%% 查找最终 Pareto 前沿
+%% 查找最终 Pareto 前沿（修正为结构化输出）
 function paretoStruct = findParetoFront(population, performance, complexity)
+    % 输出结构化的Pareto前沿，包含超参数、性能目标、复杂度目标
     popSize = size(population, 1);
     isPareto = true(popSize, 1);  % 标记非支配解
-    invalid = (performance >= 1e6) | (complexity >= 1e6);  % 标记无效解
+    invalid = (performance >= 1e6) | (complexity >= 1e6);  % 标记无效解（训练失败）
     isPareto(invalid) = false;
     
     % 筛选有效解并检查支配关系
@@ -1803,6 +1434,7 @@ function paretoStruct = findParetoFront(population, performance, complexity)
         for j = 1:length(validIndices)
             if i == j, continue; end
             idx_j = validIndices(j);
+            % 支配条件：j在所有目标上不劣于i，且至少一个目标更优（最小化问题）
             dominates = (performance(idx_j) <= performance(idx_i)) && ...
                         (complexity(idx_j) <= complexity(idx_i)) && ...
                         (performance(idx_j) < performance(idx_i) || complexity(idx_j) < complexity(idx_i));
@@ -1813,19 +1445,23 @@ function paretoStruct = findParetoFront(population, performance, complexity)
         end
     end
     
+    % 构造结构化输出
     paretoStruct = struct();
     if ~any(isPareto)
-        paretoStruct.params = [];
-        paretoStruct.performance = [];
-        paretoStruct.complexity = [];
-        paretoStruct.numSolutions = 0;
+        % 无有效非支配解时，返回空字段
+        paretoStruct.params = [];       % 超参数
+        paretoStruct.performance = [];  % 性能目标（RMSE）
+        paretoStruct.complexity = [];   % 复杂度目标
+        paretoStruct.numSolutions = 0;  % 非支配解数量
+        warning('未找到有效帕累托最优解，可能所有模型训练失败或性能极差。');
         return;
     end
     
-    paretoStruct.params = population(isPareto, :);
-    paretoStruct.performance = performance(isPareto);
-    paretoStruct.complexity = complexity(isPareto);
-    paretoStruct.numSolutions = sum(isPareto);
+    % 提取非支配解的超参数和目标值
+    paretoStruct.params = population(isPareto, :);        % 超参数矩阵（每行一个解）
+    paretoStruct.performance = performance(isPareto);     % 性能目标向量
+    paretoStruct.complexity = complexity(isPareto);       % 复杂度目标向量
+    paretoStruct.numSolutions = sum(isPareto);            % 非支配解数量
 end
 
 %% 获取池化层
@@ -1840,429 +1476,4 @@ function layer = getPoolingLayer(id, sequenceLength, filterSize)
         otherwise
             layer = maxPooling1dLayer(poolSize, 'Stride', stride, 'Padding', 'same', 'Name', 'maxpool');
     end
-end
-
-%% 训练最终模型（显示训练进度图以便观察最终训练）
-function [net, YValPred_actual, YTestPred_actual, mae_val, rmse_val, mape_val, r_val, mae_test, rmse_test, mape_test, r_test] = ...
-    trainFinalModel(bestParams, XTrain, YTrain, XVal, YVal, XTest, YTest, minSpeed, maxSpeed, sequenceLength, numFeatures, modelType)
-    
-    % 初始化输出
-    net = [];
-    YValPred_actual = [];
-    YTestPred_actual = [];
-    mae_val = NaN; rmse_val = NaN; mape_val = NaN; r_val = NaN;
-    mae_test = NaN; rmse_test = NaN; mape_test = NaN; r_test = NaN;
-    
-    % 根据模型类型构建网络
-    switch modelType
-        case 'CNN-LSTM'
-            [valid, layers, ~] = buildCNNLSTMModel(bestParams, sequenceLength, numFeatures);
-            regType = round(bestParams(8));
-            optimizerType = round(bestParams(11));
-            batchSize = max(8, round(bestParams(1)));
-            learnRate = bestParams(2);
-        case 'CNN'
-            [valid, layers, ~] = buildCNNModel(bestParams, sequenceLength, numFeatures);
-            regType = round(bestParams(9));
-            optimizerType = round(bestParams(11));
-            batchSize = max(8, round(bestParams(1)));
-            learnRate = bestParams(2);
-        case 'LSTM'
-            [valid, layers, ~] = buildLSTMModel(bestParams, sequenceLength, numFeatures);
-            regType = round(bestParams(6));
-            optimizerType = round(bestParams(9));
-            batchSize = max(8, round(bestParams(1)));
-            learnRate = bestParams(2);
-        case 'GRU'
-            [valid, layers, ~] = buildGRUModel(bestParams, sequenceLength, numFeatures);
-            regType = round(bestParams(6));
-            optimizerType = round(bestParams(9));
-            batchSize = max(8, round(bestParams(1)));
-            learnRate = bestParams(2);
-        case 'Transformer'
-            [valid, layers, ~] = buildTransformerModel(bestParams, sequenceLength, numFeatures);
-            regType = round(bestParams(7));
-            optimizerType = round(bestParams(9));
-            batchSize = max(8, round(bestParams(1)));
-            learnRate = bestParams(2);
-    end
-    
-    if ~valid
-        warning('%s 模型参数无效，无法训练', modelType);
-        return;
-    end
-    
-    % 最短序列长度
-    minSeqLength = min(cellfun(@length, XTrain));
-    layers(1) = sequenceInputLayer(numFeatures, 'MinLength', minSeqLength, 'Name', 'input_replaced');
-    
-    % 正则化映射
-    if regType == 1 || regType == 3
-        l2reg = 1e-4;
-    else
-        l2reg = 0;
-    end
-    
-    % 优化器映射
-    if optimizerType == 1
-        solver = 'adam';
-    elseif optimizerType == 2
-        solver = 'sgdm';
-    else
-        solver = 'rmsprop';
-    end
-    
-    % 训练选项（最终训练显示训练进度图）
-    try
-        options = trainingOptions(solver, ...
-            'MaxEpochs', 80, ...
-            'MiniBatchSize', batchSize, ...
-            'InitialLearnRate', learnRate, ...
-            'L2Regularization', l2reg, ...
-            'GradientThreshold', 1, ...
-            'ValidationData', {XVal, YVal}, ...
-            'ValidationFrequency', 10, ...
-            'ValidationPatience', 5, ...
-            'Plots', 'training-progress', ...
-            'Verbose', true);
-        
-        % 训练模型
-        net = trainNetwork(XTrain, YTrain, layers, options);
-        
-        % 验证集预测与评估
-        YValPred = predict(net, XVal);
-        YValPred_actual = YValPred * (maxSpeed - minSpeed) + minSpeed;
-        YVal_actual_local = YVal * (maxSpeed - minSpeed) + minSpeed;
-        
-        [mae_val, rmse_val, mape_val, r_val] = calculateMetrics(YVal_actual_local, YValPred_actual);
-        
-        % 测试集预测与评估
-        YTestPred = predict(net, XTest);
-        YTestPred_actual = YTestPred * (maxSpeed - minSpeed) + minSpeed;
-        YTest_actual_local = YTest * (maxSpeed - minSpeed) + minSpeed;
-        
-        [mae_test, rmse_test, mape_test, r_test] = calculateMetrics(YTest_actual_local, YTestPred_actual);
-        
-    catch e
-        warning('%s 模型训练失败：%s', modelType, e.message);
-    end
-end
-
-%% 计算性能指标
-function [mae, rmse, mape, r] = calculateMetrics(actual, pred)
-    mae = mean(abs(actual - pred));
-    rmse = sqrt(mean((actual - pred).^2));
-    if all(actual == 0)
-        mape = NaN;
-    else
-        mape = mean(abs((actual - pred)./actual)) * 100;
-    end
-    corrMatrix = corrcoef(actual, pred);
-    if ~isempty(corrMatrix) && size(corrMatrix,1) >= 2
-        r = corrMatrix(1,2);
-    else
-        r = 0;
-    end
-end
-
-%% 安全获取参数名（兼容 cell 和 string 数组）
-function name = paramNameToStr(paramNames, idx)
-    if iscell(paramNames)
-        name = paramNames{idx};
-    elseif isstring(paramNames)
-        name = char(paramNames(idx));
-    elseif ischar(paramNames)
-        % char array: try to split rows
-        try
-            name = strtrim(paramNames(idx,:));
-        catch
-            name = char(paramNames);
-        end
-    else
-        % 兜底转换
-        try
-            name = char(paramNames(idx));
-        catch
-            name = sprintf('param%d', idx);
-        end
-    end
-end
-%% ===== 多模型与单模型增强可视化（可直接追加到脚本末尾） =====
-% 说明：
-% - 依赖变量：modelResults (结构，按 matlab.lang.makeValidName(modelType) 存放每个模型的最终训练结果)
-% -               allResults (结构，存放每代 Pareto 及 best history)
-% -               YTest_actual, YVal_actual (反归一化后的真实值，向量或列)
-% - 若某些变量不存在或某模型没有结果，代码会自动跳过对应图表。
-
-try
-    fprintf('\n开始生成增强可视化...\n');
-    
-    % 确认必要变量存在
-    if ~exist('modelResults','var')
-        warning('变量 modelResults 不存在，跳过可视化。');
-        return;
-    end
-    if ~exist('YTest_actual','var')
-        warning('变量 YTest_actual 不存在，测试集真实值不可用，仍可绘制部分图表但会跳过相关图。');
-    end
-    if ~exist('YVal_actual','var')
-        warning('变量 YVal_actual 不存在，验证集真实值不可用。');
-    end
-    % collect models with results
-    modelFields = fieldnames(modelResults);
-    if isempty(modelFields)
-        warning('modelResults 为空，未找到任何已训练模型结果，跳过可视化。');
-        return;
-    end
-    
-    % 标记可用模型（有 YTestPred_actual）
-    available = {};
-    for i = 1:numel(modelFields)
-        m = modelFields{i};
-        if isfield(modelResults.(m),'YTestPred_actual') && ~isempty(modelResults.(m).YTestPred_actual)
-            available{end+1} = m; %#ok<SAGROW>
-        end
-    end
-    
-    % If no model has predictions, check for any with validation preds
-    if isempty(available)
-        for i = 1:numel(modelFields)
-            m = modelFields{i};
-            if isfield(modelResults.(m),'YValPred_actual') && ~isempty(modelResults.(m).YValPred_actual)
-                available{end+1} = m; %#ok<SAGROW>
-            end
-        end
-    end
-    
-    if isempty(available)
-        warning('没有模型包含预测结果（YTestPred_actual 或 YValPred_actual），跳过预测对比可视化。');
-    end
-    
-    % 多模型叠加预测（部分样本展示，防止过密）
-    if ~isempty(available) && exist('YTest_actual','var')
-        N_SHOW = min(200, length(YTest_actual)); % 展示前 N_SHOW 个测试样本
-        t = 1:N_SHOW;
-        fig = figure('Name','多模型预测叠加（测试集前若干样本）','NumberTitle','off','Position',[100 100 1200 600]);
-        plot(t, YTest_actual(t), 'k-', 'LineWidth', 2, 'DisplayName', '真实值'); hold on;
-        cmap = lines(numel(available));
-        for k = 1:numel(available)
-            mk = available{k};
-            if isfield(modelResults.(mk),'YTestPred_actual') && numel(modelResults.(mk).YTestPred_actual) >= N_SHOW
-                ypred = modelResults.(mk).YTestPred_actual(t);
-            else
-                % 若只有验证预测，使用验证集长度作示例（不可与测试对比）
-                if isfield(modelResults.(mk),'YValPred_actual') && numel(modelResults.(mk).YValPred_actual) >= N_SHOW
-                    ypred = modelResults.(mk).YValPred_actual(1:N_SHOW);
-                else
-                    continue;
-                end
-            end
-            plot(t, ypred, '-', 'Color', cmap(k,:), 'LineWidth', 1.2, 'DisplayName', mk);
-        end
-        xlabel('样本索引（测试集）'); ylabel('风速 (m/s)');
-        title('多模型预测叠加（测试集前若干样本）');
-        legend('Location','best');
-        grid on; hold off;
-        try; saveas(fig, 'multi_model_overlay.png'); catch; end
-    end
-    
-    % 误差箱线图（绝对误差）
-    if ~isempty(available) && exist('YTest_actual','var')
-        % collect absolute errors
-        errs = {};
-        labels = {};
-        for k = 1:numel(available)
-            mk = available{k};
-            if isfield(modelResults.(mk),'YTestPred_actual') && ~isempty(modelResults.(mk).YTestPred_actual)
-                preds = modelResults.(mk).YTestPred_actual;
-                minLen = min(numel(preds), numel(YTest_actual));
-                errors = abs(YTest_actual(1:minLen) - preds(1:minLen));
-                errs{end+1} = errors; %#ok<SAGROW>
-                labels{end+1} = mk; %#ok<SAGROW>
-            end
-        end
-        if ~isempty(errs)
-            % pad to matrix for boxplot
-            L = max(cellfun(@numel, errs));
-            M = nan(L, numel(errs));
-            for i = 1:numel(errs)
-                M(1:numel(errs{i}), i) = errs{i}(:);
-            end
-            fig2 = figure('Name','模型绝对误差箱线图','NumberTitle','off','Position',[200 200 1000 600]);
-            boxplot(M, 'Labels', labels, 'LabelOrientation','inline');
-            ylabel('绝对误差 (m/s)');
-            title('不同模型测试集绝对误差箱线图');
-            grid on;
-            try; saveas(fig2, 'models_error_boxplot.png'); catch; end
-        end
-    end
-    
-    % 每模型残差直方图 + 散点图
-    if ~isempty(available) && exist('YTest_actual','var')
-        nModels = numel(available);
-        nCols = min(3, nModels);
-        nRows = ceil(nModels / nCols);
-        fig3 = figure('Name','每模型残差直方图与散点图','NumberTitle','off','Position',[100 100 1400 800]);
-        for k = 1:nModels
-            mk = available{k};
-            preds = [];
-            if isfield(modelResults.(mk),'YTestPred_actual') && ~isempty(modelResults.(mk).YTestPred_actual)
-                preds = modelResults.(mk).YTestPred_actual;
-            else
-                continue;
-            end
-            len = min(numel(preds), numel(YTest_actual));
-            residuals = YTest_actual(1:len) - preds(1:len);
-            % histogram
-            subplot(nRows*2, nCols, k);
-            histogram(residuals, 30, 'Normalization','probability','FaceColor', [0.2 0.6 0.8]);
-            xlabel('残差 (m/s)'); ylabel('概率');
-            title(sprintf('%s 残差分布', mk), 'Interpreter', 'none');
-            grid on;
-            % scatter
-            subplot(nRows*2, nCols, k + nCols*nRows);
-            scatter(YTest_actual(1:len), preds(1:len), 18, 'filled', 'MarkerFaceAlpha', 0.6);
-            hold on;
-            xy = [min(YTest_actual(1:len)) max(YTest_actual(1:len))];
-            plot(xy, xy, 'k--', 'LineWidth', 1);
-            xlabel('真实值 (m/s)'); ylabel('预测值 (m/s)');
-            title(sprintf('%s: 预测 vs 真实 (n=%d)', mk, len), 'Interpreter', 'none');
-            grid on; hold off;
-        end
-        try; saveas(fig3, 'per_model_residual_scatter.png'); catch; end
-    end
-    
-    % 总表：打印并绘制主要指标（MAE, RMSE, MAPE, R）
-    metrics = [];
-    metLabels = {};
-    for k = 1:numel(modelFields)
-        mk = modelFields{k};
-        if isfield(modelResults.(mk),'rmse_test')
-            metrics(end+1, :) = [modelResults.(mk).mae_test, modelResults.(mk).rmse_test, modelResults.(mk).mape_test, modelResults.(mk).r_test]; %#ok<SAGROW>
-            metLabels{end+1} = mk; %#ok<SAGROW>
-        end
-    end
-    if ~isempty(metrics)
-        fprintf('\n模型性能汇总（测试集）:\n');
-        fprintf('模型\t\tMAE\t\tRMSE\t\tMAPE(%%)\t\tR\n');
-        for i = 1:size(metrics,1)
-            fprintf('%s\t%.4f\t%.4f\t%.2f\t\t%.4f\n', metLabels{i}, metrics(i,1), metrics(i,2), metrics(i,3), metrics(i,4));
-        end
-        
-        % 绘制 RMSE 热图/条形图
-        fig4 = figure('Name','模型指标比较','NumberTitle','off','Position',[300 300 1000 400]);
-        subplot(1,2,1);
-        bar(metrics(:,2));
-        set(gca,'XTickLabel',metLabels,'XTickLabelRotation',45);
-        ylabel('RMSE (m/s)');
-        title('各模型 RMSE 比较');
-        grid on;
-        subplot(1,2,2);
-        bar(metrics(:,3));
-        set(gca,'XTickLabel',metLabels,'XTickLabelRotation',45);
-        ylabel('MAPE (%)');
-        title('各模型 MAPE 比较');
-        grid on;
-        try; saveas(fig4, 'models_metrics_summary.png'); catch; end
-    end
-    
-    % 若存在 allResults 且包含某个模型（例如 CNN-LSTM），绘制该模型的 Pareto & 最终预测综合图
-    targetModelName = 'CNN-LSTM';
-    targetKey = matlab.lang.makeValidName(targetModelName);
-    if exist('allResults','var') && isfield(allResults, targetKey) && isfield(modelResults, targetKey)
-        try
-            fprintf('生成 %s 的 Pareto 与最终预测综合图...\n', targetModelName);
-            resAll = allResults.(targetKey);
-            resFinal = modelResults.(targetKey);
-            allPareto = resAll.allParetoFronts;
-            bestPerfHist = resAll.bestPerformanceHistory;
-            bestCompHist = resAll.bestComplexityHistory;
-            specificMap = resAll.specificGenData;
-            
-            % Pareto 演化图（RMSE vs Complexity）
-            figp = figure('Name', sprintf('%s Pareto 演化', targetModelName), 'NumberTitle','off','Position',[150 150 1200 700]);
-            hold on;
-            gens = numel(allPareto);
-            cmap = parula(gens);
-            for g = 1:gens
-                p = allPareto{g};
-                if isstruct(p) && p.numSolutions>0
-                    scatter(p.complexity, p.performance, 40, 'MarkerEdgeColor', cmap(g,:), 'DisplayName', sprintf('Gen %d', g));
-                end
-            end
-            xlabel('复杂度'); ylabel('RMSE (m/s)');
-            title(sprintf('%s: 各代 Pareto 前沿 (RMSE vs 复杂度)', targetModelName),'Interpreter','none');
-            legend('Location','bestoutside');
-            grid on; hold off;
-            try; saveas(figp, sprintf('%s_pareto_evolution.png', targetKey)); catch; end
-            
-            % 最终模型预测综合图（验证 / 测试）
-            figf = figure('Name', sprintf('%s 最终预测分析', targetModelName), 'NumberTitle','off','Position',[100 100 1400 900]);
-            % validation
-            subplot(3,2,1);
-            if isfield(resFinal,'YValPred_actual') && ~isempty(resFinal.YValPred_actual) && exist('YVal_actual','var')
-                plot(YVal_actual, 'b-', 'LineWidth', 1.5); hold on;
-                plot(resFinal.YValPred_actual, 'r--', 'LineWidth', 1.2);
-                title(sprintf('%s 验证集：真实 vs 预测 (RMSE=%.3f)', targetModelName, resFinal.rmse_val), 'Interpreter','none');
-                legend({'实际','预测'}, 'Location','best'); grid on; hold off;
-            else
-                text(0.5,0.5,'无验证预测数据','HorizontalAlignment','center'); axis off;
-            end
-            % test plot
-            subplot(3,2,2);
-            if isfield(resFinal,'YTestPred_actual') && ~isempty(resFinal.YTestPred_actual) && exist('YTest_actual','var')
-                plot(YTest_actual, 'b-', 'LineWidth', 1.5); hold on;
-                plot(resFinal.YTestPred_actual, 'r--', 'LineWidth', 1.2);
-                title(sprintf('%s 测试集：真实 vs 预测 (RMSE=%.3f)', targetModelName, resFinal.rmse_test), 'Interpreter','none');
-                legend({'实际','预测'}, 'Location','best'); grid on; hold off;
-            else
-                text(0.5,0.5,'无测试预测数据','HorizontalAlignment','center'); axis off;
-            end
-            % residual histogram
-            subplot(3,2,3);
-            if isfield(resFinal,'YTestPred_actual') && ~isempty(resFinal.YTestPred_actual) && exist('YTest_actual','var')
-                resids = YTest_actual(1:min(numel(YTest_actual),numel(resFinal.YTestPred_actual))) - resFinal.YTestPred_actual(1:min(numel(YTest_actual),numel(resFinal.YTestPred_actual)));
-                histogram(resids, 30, 'Normalization','probability'); title('测试集残差分布'); xlabel('残差 (m/s)'); grid on;
-            else
-                axis off;
-            end
-            % scatter and R
-            subplot(3,2,4);
-            if isfield(resFinal,'YTestPred_actual') && ~isempty(resFinal.YTestPred_actual) && exist('YTest_actual','var')
-                preds = resFinal.YTestPred_actual; len = min(numel(preds), numel(YTest_actual));
-                scatter(YTest_actual(1:len), preds(1:len), 18, 'filled'); hold on;
-                xy = [min(YTest_actual(1:len)) max(YTest_actual(1:len))];
-                plot(xy, xy, 'k--'); title(sprintf('预测 vs 真实 (R=%.3f)', resFinal.r_test)); xlabel('真实'); ylabel('预测'); grid on; hold off;
-            else
-                axis off;
-            end
-            % metrics bar
-            subplot(3,2,5);
-            if isfield(resFinal,'mae_val')
-                vals = [resFinal.mae_val, resFinal.rmse_val, resFinal.mape_val, resFinal.r_val];
-                tests = [resFinal.mae_test, resFinal.rmse_test, resFinal.mape_test, resFinal.r_test];
-                b = bar([vals; tests]');
-                set(gca,'XTickLabel',{'MAE','RMSE','MAPE','R'});
-                legend({'验证','测试'}, 'Location','best');
-                title('验证 vs 测试 指标');
-                grid on;
-            else
-                axis off;
-            end
-            % abs error time series
-            subplot(3,2,6);
-            if exist('resids','var')
-                plot(abs(resids), 'g-'); title('测试集绝对误差时间序列'); xlabel('样本'); ylabel('绝对误差 (m/s)'); grid on;
-            else
-                axis off;
-            end
-            try; saveas(figf, sprintf('%s_final_analysis.png', targetKey)); catch; end
-        catch ME2
-            warning('绘制 %s 详细可视化失败：%s', targetModelName, ME2.message);
-        end
-    end
-    
-    fprintf('可视化生成完成。\n');
-catch ME_all
-    warning('增强可视化发生错误：%s', ME_all.message);
 end
