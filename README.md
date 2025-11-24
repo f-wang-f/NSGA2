@@ -1,3 +1,2 @@
-# 基于NSGA2的CNN-LSTM风速预测模型
-代码仓库
-自己学习过程的记录
+# 基于NSGA2的CNN-BiLSTM风速预测模型
+在performance和complexity两个方面对模型进行了优化
