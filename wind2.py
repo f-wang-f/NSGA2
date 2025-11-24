@@ -7,77 +7,38 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Subset
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import math
-from copy import deepcopy
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import pickle
+import time
 import warnings
+import traceback
+from scipy.stats import pearsonr
 
 warnings.filterwarnings('ignore')
-
 # 设置中文字体
-
 plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei", "SimSun", "DejaVu Sans"]
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+plt.rcParams['axes.unicode_minus'] = False
 
-# 设备配置
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# 1. 数据读取与预处理
+# ==================== 1. 数据读取与预处理 ====================
 print('正在读取风速数据...')
 filename = 'winddata.xlsx'
-
 try:
     data = pd.read_excel(filename)
-    feature_columns = ['Wind Direction', 'Theoretical_Power_Curve (KWh)',
-                       'LV ActivePower (kW)', 'Wind Speed (m/s)']
+    feature_columns = ['Wind Direction', 'Theoretical_Power_Curve (KWh)', 'LV ActivePower (kW)', 'Wind Speed (m/s)']
     target_column = 'Wind Speed (m/s)'
-
-    # 检查是否存在所有特征列
-    found = True
     for col in feature_columns:
         if col not in data.columns:
-            found = False
-            break
-
-    if not found:
-        print('可用列名：')
-        for col in data.columns:
-            print(f'  {col}')
-        raise ValueError('未找到所有特征列。')
-
-    # 提取特征数据
+            raise ValueError(f'未找到特征列: {col}')
     feature_data = data[feature_columns].values
-
 except Exception as e:
     print(f'无法读取 Excel 文件: {e}')
     raise
 
-# 数据趋势可视化
-print('绘制数据总体趋势图...')
-n_samples = feature_data.shape[0]
-time_axis = np.arange(n_samples)
-
-plt.figure(figsize=(12, 10))
-plt.suptitle('各特征数据趋势', fontsize=16)
-
-for i, col in enumerate(feature_columns):
-    plt.subplot(len(feature_columns), 1, i + 1)
-    plt.plot(time_axis, feature_data[:, i], linewidth=1.2)
-    plt.title(f'{col} 随时间变化趋势', fontsize=12)
-    plt.xlabel('时间（样本点）', fontsize=10)
-    plt.ylabel(col, fontsize=10)
-    plt.grid(True)
-    plt.box(True)
-
-plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.show()
-
 # 数据清洗
 valid_rows = np.all(~np.isnan(feature_data) & ~np.isinf(feature_data), axis=1)
 feature_data = feature_data[valid_rows, :]
-
 if feature_data.shape[0] < 100:
-    raise ValueError('数据不足（少于100个样本），请提供更多数据。')
+    raise ValueError('数据不足(少于100个样本),请提供更多数据。')
 
 # 数据归一化
 scaler = MinMaxScaler()
@@ -96,515 +57,583 @@ class WindDataset(Dataset):
         return len(self.data) - self.sequence_length
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.sequence_length, :]  # 前sequence_length个时间步作为输入
-        y = self.data[idx + self.sequence_length, -1]  # 下一个时间步的风速作为目标
-        return torch.FloatTensor(x).transpose(0, 1), torch.FloatTensor([y])
+        x = self.data[idx:idx + self.sequence_length]
+        y = self.data[idx + self.sequence_length, -1]
+        return torch.FloatTensor(x), torch.FloatTensor([y])
 
 
-sequence_length = 5
+sequence_length = 1
 dataset = WindDataset(feature_data_norm, sequence_length)
 
-# 核心修改：按6:1:1比例划分（训练集6/8，验证集1/8，测试集1/8），保持时间顺序
-train_ratio = 6/8  # 62.5%
-val_ratio = 1/8    # 12.5%
-test_ratio = 1/8   # 12.5%
-
+# 按6:1:1比例划分
+train_ratio = 0.7
+val_ratio = 0.15
 num_samples = len(dataset)
 num_train = int(train_ratio * num_samples)
 num_val = int(val_ratio * num_samples)
-num_test = num_samples - num_train - num_val  # 确保总和等于样本数
-
-# 时序划分：严格按时间顺序切割（训练集→验证集→测试集）
+num_test = num_samples - num_train - num_val
 train_dataset = Subset(dataset, range(num_train))
 val_dataset = Subset(dataset, range(num_train, num_train + num_val))
 test_dataset = Subset(dataset, range(num_train + num_val, num_samples))
-
-# 反归一化参数（目标变量为风速，对应最后一列）
 min_speed = min_vals[-1]
 max_speed = max_vals[-1]
-
-print(f'数据预处理完成。训练样本数：{num_train}，验证样本数：{num_val}，测试样本数：{num_test}')
-print(f'划分方式：按时间顺序（6:1:1），无时间交叉')
+print(f'数据预处理完成。训练样本数:{num_train},验证样本数:{num_val},测试样本数:{num_test}')
 
 
-# 2. 模型定义
-class FeatureWeightedLayer(nn.Module):
-    def __init__(self, num_features):
-        super(FeatureWeightedLayer, self).__init__()
-        self.weights = nn.Parameter(torch.ones(num_features, 1))
+# ==================== 2. 模型定义(增强健壮性) ====================
+class HybridCNNBiLSTM(nn.Module):
+    def __init__(self, topo, cnn_params, lstm_params, num_features, sequence_length):
+        super(HybridCNNBiLSTM, self).__init__()
+        self.num_features = num_features
+        self.sequence_length = sequence_length
+        n = 5
+        self.n = n
+        self.feature_weights = nn.Parameter(torch.ones(num_features))
 
-    def forward(self, x):
-        # x shape: (batch_size, num_features, seq_len)
-        weighted = x * self.weights  # 特征加权
-        return weighted
+        # 解析拓扑结构
+        bits_length = n * (n - 1) // 2
+        if len(topo) != bits_length:
+            raise ValueError(f"拓扑长度不匹配: {len(topo)} != {bits_length}")
+        self.adj = np.zeros((n, n), dtype=int)
+        k = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                self.adj[i, j] = topo[k]
+                k += 1
 
+        # 计算每个模块的输入通道数
+        in_channels_list = [0] * n
+        in_channels_list[0] = num_features
+        for i in range(1, n):
+            num_incoming = np.sum(self.adj[:, i])
+            if num_incoming == 0:
+                num_incoming = 1
+            incoming_channels = []
+            for j in range(i):
+                if self.adj[j, i] == 1:
+                    if j < 3:
+                        incoming_channels.append(16 * (cnn_params[j][0] + 1))
+                    else:
+                        incoming_channels.append(32 * (lstm_params[j - 3][0] + 1))
+            if incoming_channels:
+                in_channels_list[i] = sum(incoming_channels)
+            else:
+                in_channels_list[i] = 16
 
-class CNNBiLSTM(nn.Module):
-    def __init__(self, num_features, num_filters1, filter_size1, num_filters2,
-                 filter_size2, lstm_units1, lstm_units2, pool_type, num_conv_layers,
-                 dropout_prob1, dropout_prob2, conv_dropout, activation_function):
-        super(CNNBiLSTM, self).__init__()
+        # 创建模块
+        self.convs = nn.ModuleList()
+        self.lstms = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        self.acts = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        self.adaptive_pools = nn.ModuleList()
 
-        self.feature_weight = FeatureWeightedLayer(num_features)
+        act_map = {0: nn.Softplus, 1: nn.Softsign, 2: nn.ELU, 3: nn.Softmax, 4: nn.Sigmoid, 5: nn.Tanh, 6: nn.ReLU,
+                   7: nn.Identity}
 
-        # 卷积层
-        self.conv1 = nn.Conv1d(num_features, num_filters1, filter_size1, padding='same')
-        self.bn1 = nn.BatchNorm1d(num_filters1)
+        for i in range(n):
+            in_channels = max(in_channels_list[i], 1)
+            if i < 3:  # CNN modules
+                knum, ksize, kact, pt, ps = cnn_params[i]
+                out_channels = 16 * (knum + 1)
+                kernel_size = 2 * ksize + 3
+                self.convs.append(nn.Conv1d(in_channels, out_channels, kernel_size, padding='same'))
+            else:  # BiLSTM modules
+                knum, lnum, kact, pt, ps = lstm_params[i - 3]
+                hidden = 16 * (knum + 1)
+                dropout = ps * 0.1
+                num_layers = lnum + 1
+                self.lstms.append(
+                    nn.LSTM(in_channels, hidden, num_layers=num_layers, bidirectional=True, batch_first=False,
+                            dropout=dropout))
+                out_channels = 2 * hidden
 
-        # 激活函数
-        if activation_function == 1:
-            self.act1 = nn.ReLU()
-        elif activation_function == 2:
-            self.act1 = nn.LeakyReLU(0.01)
-        elif activation_function == 3:
-            self.act1 = nn.Tanh()
-        else:  # 4
-            self.act1 = nn.Sigmoid()
+            self.bns.append(nn.BatchNorm1d(out_channels))
+            if kact == 3:
+                self.acts.append(act_map[kact](dim=1))
+            else:
+                self.acts.append(act_map[kact]())
 
-        self.drop_conv1 = nn.Dropout(conv_dropout) if conv_dropout > 0 else nn.Identity()
+            effective_ps = max(ps, 1)
+            pool_size = 2 * effective_ps + 3
+            if pt == 0:
+                self.pools.append(nn.MaxPool1d(pool_size, stride=1, padding=(pool_size - 1) // 2))
+            elif pt == 1:
+                self.pools.append(nn.AvgPool1d(pool_size, stride=1, padding=(pool_size - 1) // 2))
+            else:
+                self.pools.append(nn.Identity())
+            self.adaptive_pools.append(nn.AdaptiveAvgPool1d(sequence_length))
 
-        # 池化层
-        if pool_type == 1:
-            self.pool = nn.MaxPool1d(2, stride=1, padding=1)
-        else:  # 2
-            self.pool = nn.AvgPool1d(2, stride=1, padding=1)
-
-        # 第二卷积层（可选）
-        self.num_conv_layers = num_conv_layers
-        if num_conv_layers == 2:
-            self.conv2 = nn.Conv1d(num_filters1, num_filters2, filter_size2, padding='same')
-            self.bn2 = nn.BatchNorm1d(num_filters2)
-
-            if activation_function == 1:
-                self.act2 = nn.ReLU()
-            elif activation_function == 2:
-                self.act2 = nn.LeakyReLU(0.01)
-            elif activation_function == 3:
-                self.act2 = nn.Tanh()
-            else:  # 4
-                self.act2 = nn.Sigmoid()
-
-            self.drop_conv2 = nn.Dropout(conv_dropout) if conv_dropout > 0 else nn.Identity()
-            rnn_input_size = num_filters2
-        else:
-            rnn_input_size = num_filters1
-
-        # BiLSTM层
-        self.bilstm1 = nn.LSTM(rnn_input_size, lstm_units1, batch_first=True, bidirectional=True)
-        self.drop1 = nn.Dropout(dropout_prob1)
-        self.bilstm2 = nn.LSTM(lstm_units1 * 2, lstm_units2, batch_first=True, bidirectional=True)
-        self.drop2 = nn.Dropout(dropout_prob2)
-
-        # 输出层
-        self.fc_out = nn.Linear(lstm_units2 * 2, 1)
-
-    def forward(self, x):
-        # x shape: (batch_size, num_features, seq_len)
-
-        # 特征加权
-        x = self.feature_weight(x)
-
-        # 卷积块1
-        x = self.conv1(x)  # (batch_size, num_filters1, seq_len)
-        x = self.bn1(x)
-        x = self.act1(x)
-        x = self.drop_conv1(x)
-
-        # 可选的卷积块2
-        if self.num_conv_layers == 2:
-            x = self.conv2(x)  # (batch_size, num_filters2, seq_len)
-            x = self.bn2(x)
-            x = self.act2(x)
-            x = self.drop_conv2(x)
-
-        # 池化
-        x = self.pool(x)  # (batch_size, filters, seq_len)
-
-        # 转换为LSTM输入格式 (batch_size, seq_len, features)
-        x = x.transpose(1, 2)
-
-        # BiLSTM层
-        x, _ = self.bilstm1(x)  # (batch_size, seq_len, lstm_units1*2)
-        x = self.drop1(x)
-        x, _ = self.bilstm2(x)  # (batch_size, seq_len, lstm_units2*2)
-        x = self.drop2(x)
-
-        # 取最后一个时间步的输出
-        x = x[:, -1, :]
-
-        # 输出层
-        x = self.fc_out(x)  # (batch_size, 1)
-        return x
-
-
-# 基准模型 - BiLSTM
-class BiLSTM(nn.Module):
-    def __init__(self, num_features, lstm_units1, lstm_units2, dropout_prob1, dropout_prob2):
-        super(BiLSTM, self).__init__()
-        self.feature_weight = FeatureWeightedLayer(num_features)
-        self.bilstm1 = nn.LSTM(num_features, lstm_units1, batch_first=True, bidirectional=True)
-        self.drop1 = nn.Dropout(dropout_prob1)
-        self.bilstm2 = nn.LSTM(lstm_units1 * 2, lstm_units2, batch_first=True, bidirectional=True)
-        self.drop2 = nn.Dropout(dropout_prob2)
-        self.fc_out = nn.Linear(lstm_units2 * 2, 1)
-
-    def forward(self, x):
-        # x shape: (batch_size, num_features, seq_len)
-        x = self.feature_weight(x)
-        x = x.transpose(1, 2)  # (batch_size, seq_len, num_features)
-
-        x, _ = self.bilstm1(x)
-        x = self.drop1(x)
-        x, _ = self.bilstm2(x)
-        x = self.drop2(x)
-
-        x = x[:, -1, :]
-        x = self.fc_out(x)
-        return x
-
-
-# 基准模型 - GRU
-class GRU(nn.Module):
-    def __init__(self, num_features, gru_units1, gru_units2, dropout_prob1, dropout_prob2):
-        super(GRU, self).__init__()
-        self.feature_weight = FeatureWeightedLayer(num_features)
-        self.gru1 = nn.GRU(num_features, gru_units1, batch_first=True, bidirectional=True)
-        self.drop1 = nn.Dropout(dropout_prob1)
-        self.gru2 = nn.GRU(gru_units1 * 2, gru_units2, batch_first=True, bidirectional=True)
-        self.drop2 = nn.Dropout(dropout_prob2)
-        self.fc_out = nn.Linear(gru_units2 * 2, 1)
-
-    def forward(self, x):
-        x = self.feature_weight(x)
-        x = x.transpose(1, 2)
-
-        x, _ = self.gru1(x)
-        x = self.drop1(x)
-        x, _ = self.gru2(x)
-        x = self.drop2(x)
-
-        x = x[:, -1, :]
-        x = self.fc_out(x)
-        return x
-
-
-# 基准模型 - CNN
-class CNN(nn.Module):
-    def __init__(self, num_features, num_filters1, filter_size1, num_filters2, filter_size2):
-        super(CNN, self).__init__()
-        self.feature_weight = FeatureWeightedLayer(num_features)
-        self.conv1 = nn.Conv1d(num_features, num_filters1, filter_size1, padding='same')
-        self.bn1 = nn.BatchNorm1d(num_filters1)
-        self.act1 = nn.ReLU()
-        self.pool1 = nn.MaxPool1d(2, stride=1, padding=1)
-
-        self.conv2 = nn.Conv1d(num_filters1, num_filters2, filter_size2, padding='same')
-        self.bn2 = nn.BatchNorm1d(num_filters2)
-        self.act2 = nn.ReLU()
-        self.pool2 = nn.MaxPool1d(2, stride=1, padding=1)
-
+        total_out_channels = sum(
+            [16 * (cnn_params[i][0] + 1) if i < 3 else 32 * (lstm_params[i - 3][0] + 1) for i in range(n)])
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc1 = nn.Linear(num_filters2, 32)
-        self.act3 = nn.ReLU()
-        self.drop = nn.Dropout(0.3)
-        self.fc_out = nn.Linear(32, 1)
+        self.fc = nn.Linear(total_out_channels, 1)
 
     def forward(self, x):
-        x = self.feature_weight(x)
-
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
-        x = self.pool1(x)
-
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.act2(x)
-        x = self.pool2(x)
-
-        x = self.global_pool(x).squeeze(-1)
-        x = self.fc1(x)
-        x = self.act3(x)
-        x = self.drop(x)
-        x = self.fc_out(x)
-        return x
-
-
-# 基准模型 - Transformer
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        return x
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError("输入包含NaN或Inf值")
+        x = x.transpose(1, 2)
+        x = x * self.feature_weights.unsqueeze(0).unsqueeze(2)
+        outputs = []
+        for i in range(self.n):
+            inputs = []
+            if i == 0:
+                inputs.append(x)
+            else:
+                for prev in range(i):
+                    if self.adj[prev, i] == 1:
+                        inputs.append(outputs[prev])
+            if not inputs:
+                inputs.append(x)
+            input_i = torch.cat(inputs, dim=1) if len(inputs) > 1 else inputs[0]
+            if i < 3:
+                out = self.convs[i](input_i)
+            else:
+                input_lstm = input_i.permute(2, 0, 1)
+                out_lstm, _ = self.lstms[i - 3](input_lstm)
+                out = out_lstm.permute(1, 2, 0)
+            out = self.bns[i](out)
+            out = self.acts[i](out)
+            out = self.pools[i](out)
+            out = self.adaptive_pools[i](out)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError(f"模块{i}输出包含NaN或Inf值")
+            outputs.append(out)
+        final = torch.cat(outputs, dim=1)
+        final = self.global_pool(final).squeeze(-1)
+        final = self.fc(final)
+        return final
 
 
-class TransformerModel(nn.Module):
-    def __init__(self, num_features, embedding_dim, num_heads, ffn_dim, seq_len):
-        super(TransformerModel, self).__init__()
-        self.feature_weight = FeatureWeightedLayer(num_features)
-        self.embedding_proj = nn.Linear(num_features, embedding_dim)
-        self.pos_encoder = PositionalEncoding(embedding_dim, seq_len)
-
-        transformer_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=num_heads,
-            dim_feedforward=ffn_dim,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(transformer_layer, num_layers=1)
-
-        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc1 = nn.Linear(embedding_dim, 32)
-        self.relu_final = nn.ReLU()
-        self.drop_final = nn.Dropout(0.1)
-        self.fc_out = nn.Linear(32, 1)
-
-    def forward(self, x):
-        # x shape: (batch_size, num_features, seq_len)
-        x = self.feature_weight(x)
-        x = x.transpose(1, 2)  # (batch_size, seq_len, num_features)
-
-        x = self.embedding_proj(x)  # (batch_size, seq_len, embedding_dim)
-        x = self.pos_encoder(x.transpose(0, 1)).transpose(0, 1)  # 位置编码
-
-        x = self.transformer_encoder(x)  # (batch_size, seq_len, embedding_dim)
-
-        x = x.transpose(1, 2)  # (batch_size, embedding_dim, seq_len)
-        x = self.global_avg_pool(x).squeeze(-1)  # (batch_size, embedding_dim)
-
-        x = self.fc1(x)
-        x = self.relu_final(x)
-        x = self.drop_final(x)
-        x = self.fc_out(x)
-        return x
+# ==================== 3. 编码和解码函数(修改:学习率为连续值) ====================
+def encode_individual(topo, cnn_params, lstm_params, setting):
+    """将个体编码为可变长度数组 - setting[2]现在是连续学习率值"""
+    individual = topo + [item for sublist in cnn_params for item in sublist] + [item for sublist in lstm_params for item
+                                                                                in sublist] + setting
+    return np.array(individual, dtype=float)
 
 
-# 3. NSGA-II 超参数优化
-def initialize_population(pop_size, lb, ub, int_con):
-    num_vars = len(lb)
-    population = np.random.rand(pop_size, num_vars) * (np.array(ub) - np.array(lb)) + np.array(lb)
+def decode_individual(individual):
+    """解码个体 - setting[2]现在是连续学习率值"""
+    idx = 0
+    n = 5
+    bits_length = n * (n - 1) // 2
+    topo = [int(round(individual[idx + i])) for i in range(bits_length)]
+    idx += bits_length
 
-    # 处理整数变量
-    for i in range(pop_size):
-        for j in int_con:
-            population[i, j] = round(population[i, j])
+    cnn_params = []
+    for i in range(3):
+        knum = int(round(individual[idx]))
+        ksize = int(round(individual[idx + 1]))
+        kact = int(round(individual[idx + 2]))
+        pt = int(round(individual[idx + 3]))
+        ps = int(round(individual[idx + 4]))
+        knum = max(0, min(7, knum))
+        ksize = max(0, min(3, ksize))
+        kact = max(0, min(7, kact))
+        pt = max(0, min(2, pt))
+        ps = max(0, min(3, ps))
+        cnn_params.append([knum, ksize, kact, pt, ps])
+        idx += 5
 
+    lstm_params = []
+    for i in range(2):
+        knum = int(round(individual[idx]))
+        lnum = int(round(individual[idx + 1]))
+        kact = int(round(individual[idx + 2]))
+        pt = int(round(individual[idx + 3]))
+        ps = int(round(individual[idx + 4]))
+        knum = max(0, min(7, knum))
+        lnum = max(0, min(3, lnum))
+        kact = max(0, min(7, kact))
+        pt = max(0, min(2, pt))
+        ps = max(0, min(3, ps))
+        lstm_params.append([knum, lnum, kact, pt, ps])
+        idx += 5
+
+    # 修改:setting中lr(索引2)保持为连续值,不做四舍五入
+    bs = int(round(individual[idx]))
+    opt = int(round(individual[idx + 1]))
+    lr = individual[idx + 2]  # 保持连续值
+    reg = int(round(individual[idx + 3]))
+
+    # 边界检查
+    bs = max(0, min(3, bs))
+    opt = max(0, min(3, opt))
+    lr = max(0.0001, min(0.01, lr))  # 学习率范围[0.0001, 0.01]
+    reg = max(0, min(3, reg))
+
+    setting = [bs, opt, lr, reg]
+    return topo, cnn_params, lstm_params, setting
+
+
+def get_individual_length():
+    """获取个体长度"""
+    n = 5
+    return n * (n - 1) // 2 + 5 * 3 + 5 * 2 + 4
+
+
+# ==================== 4. 初始化(修改:学习率为连续值) ====================
+def initialize_individual():
+    """初始化单个个体 - 学习率为连续随机数"""
+    n = 5
+    bits_length = n * (n - 1) // 2
+    topo = [np.random.randint(0, 2) for _ in range(bits_length)]
+
+    cnn_params = []
+    for i in range(3):
+        knum = np.random.randint(0, 8)
+        ksize = np.random.randint(0, 4)
+        kact = np.random.randint(0, 8)
+        pt = np.random.randint(0, 3)
+        ps = np.random.randint(0, 4)
+        cnn_params.append([knum, ksize, kact, pt, ps])
+
+    lstm_params = []
+    for i in range(2):
+        knum = np.random.randint(0, 8)
+        lnum = np.random.randint(0, 4)
+        kact = np.random.randint(0, 8)
+        pt = np.random.randint(0, 3)
+        ps = np.random.randint(0, 4)
+        lstm_params.append([knum, lnum, kact, pt, ps])
+
+    bs = np.random.randint(0, 4)
+    opt = np.random.randint(0, 4)
+    lr = np.random.uniform(0.0001, 0.01)  # 修改:生成连续学习率
+    reg = np.random.randint(0, 4)
+    setting = [bs, opt, lr, reg]
+
+    return encode_individual(topo, cnn_params, lstm_params, setting)
+
+
+def is_valid_individual(individual):
+    """验证个体有效性"""
+    try:
+        topo, cnn_params, lstm_params, setting = decode_individual(individual)
+        n = 5
+        for i in range(1, n):
+            num_incoming = 0
+            k = 0
+            for ii in range(n):
+                for jj in range(ii + 1, n):
+                    if jj == i and topo[k] == 1:
+                        num_incoming += 1
+                    k += 1
+            if num_incoming == 0:
+                return False
+        return True
+    except:
+        return False
+
+
+def initialize_population(pop_size):
+    """初始化种群"""
+    population = []
+    attempts = 0
+    max_attempts = pop_size * 100
+    while len(population) < pop_size and attempts < max_attempts:
+        ind = initialize_individual()
+        if is_valid_individual(ind):
+            try:
+                topo, cnn_params, lstm_params, setting = decode_individual(ind)
+                batch_size, _, _, _ = decode_hyperparams(setting)
+                if batch_size <= len(train_dataset):
+                    population.append(ind)
+            except:
+                pass
+        attempts += 1
+    if len(population) < pop_size:
+        raise ValueError(f"初始化失败:仅生成{len(population)}/{pop_size}个有效个体")
     return population
 
 
-def evaluate_model(params, train_dataset, val_dataset, min_speed, max_speed, num_features, sequence_length,
-                   batch_size=32):
-    # 解析超参数
-    batch_size = round(params[0])
-    learn_rate = params[1]
-    pool_type = round(params[2])
-    num_filters1 = round(params[3])
-    filter_size1 = round(params[4])
-    filter_size2 = filter_size1
-    lstm_units1 = round(params[5])
-    lstm_units2 = round(params[6])
-    reg_type = round(params[7])
-    dropout_prob1 = params[8]
-    dropout_prob2 = params[9]
-    optimizer_type = round(params[10])
-    num_conv_layers = round(params[11])
-    conv_dropout = params[12]
-    activation_function = round(params[13])
+# ==================== 5. 变异操作(修改:学习率连续变异) ====================
+def variable_length_mutation(individual):
+    """变异操作 - 学习率使用连续随机数变异"""
+    topo, cnn_params, lstm_params, setting = decode_individual(individual)
+    n = 5
+    max_attempts = 100
+    attempts = 0
 
-    # 参数合法性检查
-    if (batch_size < 8 or batch_size > 2048 or
-            learn_rate < 1e-6 or learn_rate > 5e-2 or
-            pool_type not in [1, 2] or
-            num_filters1 < 8 or num_filters1 > 512 or
-            filter_size1 < 2 or filter_size1 > 5 or
-            lstm_units1 < 8 or lstm_units1 > 512 or
-            lstm_units2 < 8 or lstm_units2 > 512 or
-            reg_type not in [1, 2, 3] or
-            dropout_prob1 < 0 or dropout_prob1 > 0.6 or
-            dropout_prob2 < 0 or dropout_prob2 > 0.6 or
-            optimizer_type not in [1, 2, 3] or
-            num_conv_layers not in [1, 2] or
-            conv_dropout < 0 or conv_dropout > 0.6 or
-            activation_function not in [1, 2, 3, 4]):
-        return 100.0, 1e7, 100.0, 100.0, 100.0, -1.0  # 无效解的惩罚值
+    cnn_param_bounds = [(0, 7), (0, 3), (0, 7), (0, 2), (0, 3)]
+    lstm_param_bounds = [(0, 7), (0, 3), (0, 7), (0, 2), (0, 3)]
+    setting_bounds = [(0, 3), (0, 3), (0.0001, 0.01), (0, 3)]  # 修改:lr为连续范围
 
-    # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    while attempts < max_attempts:
+        mutation_region = np.random.choice([0, 1, 2])
+        new_topo = topo.copy()
+        new_cnn_params = [p.copy() for p in cnn_params]
+        new_lstm_params = [p.copy() for p in lstm_params]
+        new_setting = setting.copy()
+        mutated = False
 
-    # 创建模型
-    num_filters2 = max(8, num_filters1 // 2) if num_conv_layers == 2 else 0
-    model = CNNBiLSTM(
-        num_features, num_filters1, filter_size1, num_filters2, filter_size2,
-        lstm_units1, lstm_units2, pool_type, num_conv_layers,
-        dropout_prob1, dropout_prob2, conv_dropout, activation_function
-    ).to(device)
+        if mutation_region == 0:
+            bits_length = len(topo)
+            while True:
+                candidate_topo = [np.random.randint(0, 2) for _ in range(bits_length)]
+                if candidate_topo != topo:
+                    temp_ind = encode_individual(candidate_topo, new_cnn_params, new_lstm_params, new_setting)
+                    if is_valid_individual(temp_ind):
+                        new_topo = candidate_topo
+                        mutated = True
+                        break
 
-    # 定义损失函数和优化器
-    criterion = nn.MSELoss()
+        elif mutation_region == 1:
+            module_type = np.random.choice([0, 1])
+            if module_type == 0:
+                module_idx = np.random.randint(0, 3)
+                param_idx = np.random.randint(0, 5)
+                original_val = new_cnn_params[module_idx][param_idx]
+                min_val, max_val = cnn_param_bounds[param_idx]
+                candidate_vals = [v for v in range(min_val, max_val + 1) if v != original_val]
+                if candidate_vals:
+                    new_val = np.random.choice(candidate_vals)
+                    new_cnn_params[module_idx][param_idx] = new_val
+                    mutated = True
+            else:
+                module_idx = np.random.randint(0, 2)
+                param_idx = np.random.randint(0, 5)
+                original_val = new_lstm_params[module_idx][param_idx]
+                min_val, max_val = lstm_param_bounds[param_idx]
+                candidate_vals = [v for v in range(min_val, max_val + 1) if v != original_val]
+                if candidate_vals:
+                    new_val = np.random.choice(candidate_vals)
+                    new_lstm_params[module_idx][param_idx] = new_val
+                    mutated = True
 
-    if optimizer_type == 1:
-        optimizer = optim.Adam(model.parameters(), lr=learn_rate,
-                               weight_decay=1e-4 if reg_type in [1, 3] else 0)
-    elif optimizer_type == 2:
-        optimizer = optim.SGD(model.parameters(), lr=learn_rate, momentum=0.9,
-                              weight_decay=1e-4 if reg_type in [1, 3] else 0)
-    else:  # 3
-        optimizer = optim.RMSprop(model.parameters(), lr=learn_rate,
-                                  weight_decay=1e-4 if reg_type in [1, 3] else 0)
+        elif mutation_region == 2:
+            param_idx = np.random.randint(0, 4)
+            original_val = new_setting[param_idx]
 
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
+            # 修改:针对学习率(索引2)使用连续变异
+            if param_idx == 2:  # 学习率参数
+                min_val, max_val = setting_bounds[param_idx]
+                # 生成与原值不同的新学习率(允许一定容差)
+                while True:
+                    new_val = np.random.uniform(min_val, max_val)
+                    if abs(new_val - original_val) > 0.00001:  # 确保有实质性变化
+                        new_setting[param_idx] = new_val
+                        mutated = True
+                        break
+            else:  # 其他离散参数
+                min_val, max_val = setting_bounds[param_idx]
+                candidate_vals = [v for v in range(int(min_val), int(max_val) + 1) if v != original_val]
+                if candidate_vals:
+                    new_val = np.random.choice(candidate_vals)
+                    new_setting[param_idx] = new_val
+                    mutated = True
 
-    # 训练模型
-    best_val_loss = float('inf')
-    patience = 5
-    counter = 0
+        if mutated:
+            new_individual = encode_individual(new_topo, new_cnn_params, new_lstm_params, new_setting)
+            if not np.array_equal(new_individual, individual) and is_valid_individual(new_individual):
+                return new_individual
+        attempts += 1
 
-    for epoch in range(30):
-        model.train()
-        train_loss = 0.0
+    print(f"警告:变异尝试{max_attempts}次后仍未生成有效子代,返回父代副本")
+    return individual.copy()
 
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
 
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+def crossover_population(mating_pool):
+    """单点交叉操作，交叉概率0.8"""
+    offspring = []
+    crossover_prob = 0.8
+    for i in range(0, len(mating_pool), 2):
+        if i + 1 < len(mating_pool):
+            p1, p2 = mating_pool[i], mating_pool[i + 1]
+            if np.random.random() < crossover_prob:
+                min_len = min(len(p1), len(p2))
+                if min_len > 1:
+                    k = np.random.randint(1, min_len)
+                    c1 = np.concatenate([p1[:k], p2[k:]])
+                    c2 = np.concatenate([p2[:k], p1[k:]])
+                    if not is_valid_individual(c1):
+                        c1 = p1.copy()
+                    if not is_valid_individual(c2):
+                        c2 = p2.copy()
+                    offspring.append(c1)
+                    offspring.append(c2)
+                else:
+                    offspring.append(p1.copy())
+                    offspring.append(p2.copy())
+            else:
+                offspring.append(p1.copy())
+                offspring.append(p2.copy())
+        else:
+            offspring.append(mating_pool[i].copy())
+    return offspring
 
-            train_loss += loss.item() * inputs.size(0)
 
-        train_loss /= len(train_loader.dataset)
+# ==================== 6. 超参数解码(修改:学习率直接使用) ====================
+def decode_hyperparams(setting):
+    """解码训练超参数 - 学习率直接使用连续值"""
+    bs, opt, lr, reg = setting
+    batch_size = 32 * (bs + 1) if bs < 3 else 128
+    learn_rate = lr  # 修改:直接使用连续学习率值
+    optimizer_map = {0: 'SGD', 1: 'Adam', 2: 'AdaDelta', 3: 'RMSprop'}
+    reg_map = {0: None, 1: 'L1', 2: 'L2', 3: 'L1L2'}
+    return batch_size, learn_rate, optimizer_map[opt], reg_map[reg]
 
-        # 验证
+
+# ==================== 7. 模型评估 ====================
+def evaluate_individual(individual, train_dataset, val_dataset, min_speed, max_speed, num_features, sequence_length,
+                        device, epochs=40):
+    """评估单个个体"""
+    try:
+        topo, cnn_params, lstm_params, setting = decode_individual(individual)
+        batch_size, learn_rate, opt_type, _ = decode_hyperparams(setting)
+
+        max_batch_size = min(batch_size, len(train_dataset) // 10)
+        if max_batch_size < 1:
+            max_batch_size = 1
+        batch_size = max_batch_size
+
+        model = HybridCNNBiLSTM(topo, cnn_params, lstm_params, num_features, sequence_length).to(device)
+        model_size = sum(p.numel() for p in model.parameters())
+        if model_size > 1e7:
+            raise ValueError(f"模型过大: {model_size} 参数")
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size)
+        criterion = nn.MSELoss()
+
+        if opt_type == 'Adam':
+            optimizer = optim.Adam(model.parameters(), lr=learn_rate)
+        elif opt_type == 'SGD':
+            optimizer = optim.SGD(model.parameters(), lr=learn_rate, momentum=0.9)
+        elif opt_type == 'RMSprop':
+            optimizer = optim.RMSprop(model.parameters(), lr=learn_rate)
+        else:
+            optimizer = optim.Adadelta(model.parameters(), lr=learn_rate)
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+        for epoch in range(epochs):
+            model.train()
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                if torch.isnan(inputs).any() or torch.isinf(inputs).any():
+                    raise ValueError("输入数据包含NaN或Inf")
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                    raise ValueError("模型输出包含NaN或Inf")
+                loss = criterion(outputs, targets)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            model.eval()
+            val_loss = 0
+            val_samples = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = model(inputs)
+                    batch_loss = criterion(outputs, targets).item() * inputs.size(0)
+                    val_loss += batch_loss
+                    val_samples += inputs.size(0)
+            if val_samples > 0:
+                val_loss /= val_samples
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= 10:
+                    break
+
         model.eval()
-        val_loss = 0.0
         all_targets = []
         all_outputs = []
-
         with torch.no_grad():
             for inputs, targets in val_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                val_loss += loss.item() * inputs.size(0)
-
+                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                    raise ValueError("最终输出包含NaN或Inf")
                 all_targets.extend(targets.cpu().numpy())
                 all_outputs.extend(outputs.cpu().numpy())
 
-        val_loss /= len(val_loader.dataset)
-        scheduler.step()
+        if not all_targets or not all_outputs:
+            raise ValueError("没有有效的预测结果")
 
-        # 早停机制
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            counter = 0
-            best_model = deepcopy(model.state_dict())
-        else:
-            counter += 1
-            if counter >= patience:
-                break
+        all_targets = np.array(all_targets)
+        all_outputs = np.array(all_outputs)
+        all_targets = all_targets * (max_speed - min_speed) + min_speed
+        all_outputs = all_outputs * (max_speed - min_speed) + min_speed
 
-    # 使用最佳模型进行评估
-    model.load_state_dict(best_model)
-    model.eval()
+        if np.any(np.isnan(all_targets)) or np.any(np.isinf(all_targets)):
+            raise ValueError("反归一化后的目标值包含NaN或Inf")
+        if np.any(np.isnan(all_outputs)) or np.any(np.isinf(all_outputs)):
+            raise ValueError("反归一化后的预测值包含NaN或Inf")
 
-    all_targets = []
-    all_outputs = []
+        rmse = np.sqrt(mean_squared_error(all_targets, all_outputs))
+        if np.isnan(rmse) or np.isinf(rmse):
+            raise ValueError(f"无效的RMSE值: {rmse}")
 
-    with torch.no_grad():
-        for inputs, targets in val_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
+        complexity = sum(p.numel() for p in model.parameters())
+        return rmse, complexity
 
-            all_targets.extend(targets.cpu().numpy())
-            all_outputs.extend(outputs.cpu().numpy())
-
-    # 反归一化
-    all_targets = np.array(all_targets) * (max_speed - min_speed) + min_speed
-    all_outputs = np.array(all_outputs) * (max_speed - min_speed) + min_speed
-
-    # 计算评估指标
-    mae = mean_absolute_error(all_targets, all_outputs)
-    rmse = np.sqrt(mean_squared_error(all_targets, all_outputs))
-    mape = np.mean(np.abs((all_targets - all_outputs) / all_targets)) * 100
-    corr_matrix = np.corrcoef(all_targets.flatten(), all_outputs.flatten())
-    r = corr_matrix[0, 1] if corr_matrix.shape[0] >= 2 else 0
-
-    # 计算模型复杂度（参数数量）
-    complexity = sum(p.numel() for p in model.parameters())
-
-    return rmse, complexity, rmse, mae, mape, r
+    except Exception as e:
+        print(f"\n{'=' * 50}")
+        print(f"评估失败 - 个体ID: {id(individual)}")
+        print(f"错误类型: {type(e).__name__}")
+        print(f"错误消息: {e}")
+        print("完整堆栈追踪:")
+        traceback.print_exc()
+        print(f"{'=' * 50}\n")
+        return float('inf'), float('inf')
 
 
-def evaluate_population(population, train_dataset, val_dataset, min_speed, max_speed, sequence_length, num_features):
-    pop_size = len(population)
-    performance = np.zeros(pop_size)
-    complexity = np.zeros(pop_size)
-    rmse = np.zeros(pop_size)
-    mae = np.zeros(pop_size)
-    mape = np.zeros(pop_size)
-    r = np.zeros(pop_size)
-
-    for i in range(pop_size):
-        perf, comp, rms, ma, map_, corr = evaluate_model(
-            population[i], train_dataset, val_dataset, min_speed, max_speed,
-            num_features, sequence_length
-        )
-        performance[i] = perf
-        complexity[i] = comp
-        rmse[i] = rms
-        mae[i] = ma
-        mape[i] = map_
-        r[i] = corr
-        print(f'个体 {i + 1}/{pop_size} - 性能指标: RMSE=%.4f (m/s), 复杂度=%d' % (rms, comp))
-
-    return performance, complexity, rmse, mae, mape, r
+def evaluate_population(population, train_dataset, val_dataset, min_speed, max_speed, num_features, sequence_length,
+                        device):
+    """评估整个种群"""
+    performance = []
+    complexity = []
+    for i, ind in enumerate(population):
+        print(f" 评估个体 {i + 1}/{len(population)}...")
+        rmse, comp = evaluate_individual(ind, train_dataset, val_dataset, min_speed, max_speed, num_features,
+                                         sequence_length, device)
+        performance.append(rmse)
+        complexity.append(comp)
+    return np.array(performance), np.array(complexity)
 
 
+# ==================== 8. NSGA-II核心算法 ====================
 def fast_non_dominated_sort(performance, complexity):
+    """快速非支配排序"""
     pop_size = len(performance)
     fronts = []
     rank = np.zeros(pop_size, dtype=int)
     domination_count = np.zeros(pop_size, dtype=int)
     dominated_solutions = [[] for _ in range(pop_size)]
 
-    # 计算支配关系
+    valid_mask = np.isfinite(performance) & np.isfinite(complexity)
     for i in range(pop_size):
+        if not valid_mask[i]:
+            continue
         for j in range(pop_size):
-            if i == j:
+            if i == j or not valid_mask[j]:
                 continue
-
-            # 检查i是否支配j
             if (performance[i] <= performance[j] and complexity[i] <= complexity[j]) and \
                     (performance[i] < performance[j] or complexity[i] < complexity[j]):
                 dominated_solutions[i].append(j)
-            # 检查j是否支配i
             elif (performance[j] <= performance[i] and complexity[j] <= complexity[i]) and \
                     (performance[j] < performance[i] or complexity[j] < complexity[i]):
                 domination_count[i] += 1
 
-    # 第一前沿：被支配计数为0的解
-    current_front = np.where(domination_count == 0)[0]
+    current_front = np.where((domination_count == 0) & valid_mask)[0]
+    if len(current_front) == 0:
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) > 0:
+            current_front = valid_indices[:1]
+        else:
+            current_front = np.array([0])
     fronts.append(current_front)
-    rank[current_front] = 0  # 从0开始编号
+    rank[current_front] = 0
 
-    # 迭代生成后续前沿
     front_idx = 1
     while len(fronts[-1]) > 0:
         next_front = []
@@ -614,1154 +643,752 @@ def fast_non_dominated_sort(performance, complexity):
                 if domination_count[j] == 0:
                     next_front.append(j)
                     rank[j] = front_idx
-
         if next_front:
             fronts.append(np.array(next_front))
         else:
             break
-
         front_idx += 1
 
+    rank[~valid_mask] = front_idx + 1
     return fronts, rank
 
 
 def crowding_distance(performance, complexity, fronts):
+    """计算拥挤距离"""
     pop_size = len(performance)
     distance = np.zeros(pop_size)
 
     for front in fronts:
-        if len(front) <= 1:
+        if len(front) <= 2:
+            distance[front] = np.inf if len(front) == 2 else 0
             continue
 
-        # 提取当前前沿的目标值
-        perf = performance[front]
-        comp = complexity[front]
+        valid_mask = np.isfinite(performance[front]) & np.isfinite(complexity[front])
+        if not valid_mask.any():
+            continue
 
-        # 初始化当前前沿的拥挤度
-        dist = np.zeros(len(front))
-        dist[[0, -1]] = np.inf  # 边界解的拥挤度设为无穷大
+        front_valid = front[valid_mask]
+        sorted_perf_idx = np.argsort(performance[front_valid])
+        distance[front_valid[sorted_perf_idx[0]]] = np.inf
+        distance[front_valid[sorted_perf_idx[-1]]] = np.inf
+        sorted_comp_idx = np.argsort(complexity[front_valid])
+        distance[front_valid[sorted_comp_idx[0]]] = np.inf
+        distance[front_valid[sorted_comp_idx[-1]]] = np.inf
 
-        # 对第一个目标排序
-        sorted_idx = np.argsort(perf)
-        perf_sorted = perf[sorted_idx]
-        perf_range = perf_sorted[-1] - perf_sorted[0] if perf_sorted[-1] != perf_sorted[0] else 1e-6
+        perf_range = performance[front_valid[sorted_perf_idx[-1]]] - performance[front_valid[sorted_perf_idx[0]]]
+        comp_range = complexity[front_valid[sorted_comp_idx[-1]]] - complexity[front_valid[sorted_comp_idx[0]]]
 
-        # 计算第一个目标的贡献
-        for i in range(1, len(front) - 1):
-            dist[sorted_idx[i]] += (perf_sorted[i + 1] - perf_sorted[i - 1]) / perf_range
+        if perf_range > 0:
+            for i in range(1, len(front_valid) - 1):
+                idx = sorted_perf_idx[i]
+                prev_idx = sorted_perf_idx[i - 1]
+                next_idx = sorted_perf_idx[i + 1]
+                distance[front_valid[idx]] += (performance[front_valid[next_idx]] - performance[
+                    front_valid[prev_idx]]) / perf_range
 
-        # 对第二个目标排序
-        sorted_idx = np.argsort(comp)
-        comp_sorted = comp[sorted_idx]
-        comp_range = comp_sorted[-1] - comp_sorted[0] if comp_sorted[-1] != comp_sorted[0] else 1e-6
-
-        # 计算第二个目标的贡献
-        for i in range(1, len(front) - 1):
-            dist[sorted_idx[i]] += (comp_sorted[i + 1] - comp_sorted[i - 1]) / comp_range
-
-        distance[front] = dist
+        if comp_range > 0:
+            for i in range(1, len(front_valid) - 1):
+                idx = sorted_comp_idx[i]
+                prev_idx = sorted_comp_idx[i - 1]
+                next_idx = sorted_comp_idx[i + 1]
+                distance[front_valid[idx]] += (complexity[front_valid[next_idx]] - complexity[
+                    front_valid[prev_idx]]) / comp_range
 
     return distance
 
 
 def tournament_selection(population, rank, distance, pop_size):
+    """二元锦标赛选择"""
     mating_pool = []
+    pop_size_actual = len(population)
     for _ in range(pop_size):
-        # 随机选择两个个体
-        idx1 = np.random.randint(len(population))
-        idx2 = np.random.randint(len(population))
-
-        # 选择rank小的；rank相同则选择拥挤度大的
+        idx1, idx2 = np.random.randint(0, pop_size_actual, 2)
+        if not np.isfinite(rank[idx1]):
+            rank[idx1] = 1e6
+        if not np.isfinite(rank[idx2]):
+            rank[idx2] = 1e6
+        if not np.isfinite(distance[idx1]):
+            distance[idx1] = 0
+        if not np.isfinite(distance[idx2]):
+            distance[idx2] = 0
         if rank[idx1] < rank[idx2] or (rank[idx1] == rank[idx2] and distance[idx1] > distance[idx2]):
-            mating_pool.append(population[idx1])
+            mating_pool.append(population[idx1].copy())
         else:
-            mating_pool.append(population[idx2])
-
-    return np.array(mating_pool)
-
-
-def sbx_crossover(parent_pool, lb, ub, int_con, pc=0.8, eta_c=20):
-    pop_size, num_vars = parent_pool.shape
-    offspring = np.zeros_like(parent_pool)
-
-    # 确保父代数量为偶数
-    if pop_size % 2 != 0:
-        parent_pool = parent_pool[:-1]
-        pop_size -= 1
-
-    for i in range(0, pop_size, 2):
-        p1 = parent_pool[i]
-        p2 = parent_pool[i + 1]
-
-        for j in range(num_vars):
-            x1, x2 = p1[j], p2[j]
-
-            if np.random.rand() < pc:
-                if x1 != x2:
-                    # 确保y1 < y2
-                    y1, y2 = (x1, x2) if x1 < x2 else (x2, x1)
-
-                    # 计算交叉因子
-                    rand_val = np.random.rand()
-                    if rand_val <= 0.5:
-                        beta = (2 * rand_val) ** (1 / (eta_c + 1))
-                    else:
-                        beta = (1 / (2 * (1 - rand_val))) ** (1 / (eta_c + 1))
-
-                    # 生成子代
-                    c1 = 0.5 * ((y1 + y2) - beta * (y2 - y1))
-                    c2 = 0.5 * ((y1 + y2) + beta * (y2 - y1))
-
-                    # 边界处理
-                    c1 = max(lb[j], min(ub[j], c1))
-                    c2 = max(lb[j], min(ub[j], c2))
-
-                    # 随机分配给子代
-                    if np.random.rand() < 0.5:
-                        offspring[i, j] = c1
-                        offspring[i + 1, j] = c2
-                    else:
-                        offspring[i, j] = c2
-                        offspring[i + 1, j] = c1
-                else:
-                    # 若父代值相同，直接继承
-                    offspring[i, j] = x1
-                    offspring[i + 1, j] = x2
-            else:
-                # 不交叉，直接继承
-                offspring[i, j] = x1
-                offspring[i + 1, j] = x2
-
-    # 处理整数变量
-    for i in range(pop_size):
-        for j in int_con:
-            offspring[i, j] = round(offspring[i, j])
-
-    return offspring
+            mating_pool.append(population[idx2].copy())
+    return mating_pool
 
 
-def polynomial_mutation(offspring, lb, ub, int_con, pm=0.07, eta_m=20):
-    pop_size, num_vars = offspring.shape
-
-    for i in range(pop_size):
-        for j in range(num_vars):
-            if np.random.rand() < pm:
-                x = offspring[i, j]
-                xl, xu = lb[j], ub[j]
-
-                if x > xl and x < xu:
-                    delta1 = (x - xl) / (xu - xl)
-                    delta2 = (xu - x) / (xu - xl)
-
-                    rand_val = np.random.rand()
-                    if rand_val <= 0.5:
-                        mut_pow = 1 / (eta_m + 1)
-                        delta = (2 * rand_val + (1 - 2 * rand_val) * (delta1 ** (eta_m + 1))) ** mut_pow - 1
-                    else:
-                        mut_pow = 1 / (eta_m + 1)
-                        delta = 1 - (2 * (1 - rand_val) + 2 * (rand_val - 0.5) * (delta2 ** (eta_m + 1))) ** mut_pow
-
-                    x += delta * (xu - xl)
-
-                # 边界处理
-                x = max(xl, min(xu, x))
-
-                # 整数变量处理
-                if j in int_con:
-                    x = round(x)
-
-                offspring[i, j] = x
-
-    return offspring
-
-
-def environmental_selection(combined_pop, combined_perf, combined_complex,
-                            combined_rank, combined_dist, pop_size):
-    # 按rank升序排序
+def environmental_selection(combined_pop, combined_perf, combined_complex, combined_rank, combined_dist, pop_size):
+    """环境选择"""
     sorted_idx = np.argsort(combined_rank)
-    combined_pop = combined_pop[sorted_idx]
+    combined_pop = [combined_pop[i] for i in sorted_idx]
     combined_perf = combined_perf[sorted_idx]
     combined_complex = combined_complex[sorted_idx]
     combined_rank = combined_rank[sorted_idx]
     combined_dist = combined_dist[sorted_idx]
 
-    # 依次加入前沿直到超过种群大小
-    current_size = 0
     new_pop = []
     new_perf = []
     new_complex = []
+    current_size = 0
 
-    unique_ranks = np.unique(combined_rank)
-
-    for rank in unique_ranks:
+    for rank in np.unique(combined_rank):
         if current_size >= pop_size:
             break
-
-        # 当前rank的所有个体
         mask = combined_rank == rank
-        current_front = combined_pop[mask]
-        current_front_perf = combined_perf[mask]
-        current_front_complex = combined_complex[mask]
-        current_front_dist = combined_dist[mask]
+        front_pop = [combined_pop[i] for i in range(len(combined_pop)) if mask[i]]
+        front_perf = combined_perf[mask]
+        front_complex = combined_complex[mask]
+        front_dist = combined_dist[mask]
 
-        front_size = len(current_front)
-
-        if current_size + front_size <= pop_size:
-            # 全部加入
-            new_pop.extend(current_front)
-            new_perf.extend(current_front_perf)
-            new_complex.extend(current_front_complex)
-            current_size += front_size
+        if current_size + len(front_pop) <= pop_size:
+            new_pop.extend(front_pop)
+            new_perf.extend(front_perf)
+            new_complex.extend(front_complex)
+            current_size += len(front_pop)
         else:
-            # 部分加入（按拥挤度降序）
             remaining = pop_size - current_size
-            sorted_dist_idx = np.argsort(current_front_dist)[::-1]  # 降序排列
-            selected = sorted_dist_idx[:remaining]
-
-            new_pop.extend(current_front[selected])
-            new_perf.extend(current_front_perf[selected])
-            new_complex.extend(current_front_complex[selected])
+            valid_dist = np.isfinite(front_dist)
+            if not valid_dist.any():
+                selected = np.random.choice(len(front_pop), remaining, replace=False)
+            else:
+                sorted_dist_idx = np.argsort(front_dist[valid_dist])[::-1]
+                selected = np.where(valid_dist)[0][sorted_dist_idx[:remaining]]
+            new_pop.extend([front_pop[i] for i in selected])
+            new_perf.extend(front_perf[selected])
+            new_complex.extend(front_complex[selected])
             current_size = pop_size
 
-    return np.array(new_pop), np.array(new_perf), np.array(new_complex)
-
-
-def find_pareto_front(population, performance, complexity, fronts):
-    if not fronts:
-        return {'params': [], 'performance': [], 'complexity': [], 'num_solutions': 0}
-
-    # 第一前沿即为Pareto前沿
-    pareto_indices = fronts[0]
-
-    return {
-        'params': population[pareto_indices],
-        'performance': performance[pareto_indices],
-        'complexity': complexity[pareto_indices],
-        'num_solutions': len(pareto_indices)
-    }
-
-
-# 运行NSGA-II优化
-print('开始 NSGA-II 超参数优化...')
-
-# 超参数搜索范围（下界、上界）
-lb = [32, 1e-6, 1, 32, 1, 32, 16, 1, 0.1, 0.1, 1, 1, 0.1, 1]
-ub = [256, 5e-2, 2, 512, 7, 512, 256, 3, 0.55, 0.55, 3, 2, 0.55, 4]
-int_con = [0, 2, 3, 4, 5, 6, 7, 10, 11, 13]  # 整数变量索引（0-based）
-
-# NSGA-II 算法参数
-population_size = 10
-max_generations = 3
-pc = 0.8
-eta_c = 20
-pm = 0.07
-eta_m = 20
-
-num_vars = len(lb)
-population = initialize_population(population_size, lb, ub, int_con)
-
-# 记录优化过程
-best_params_history = np.zeros((max_generations, num_vars))
-best_performance_history = np.zeros(max_generations)
-best_complexity_history = np.zeros(max_generations)
-all_pareto_fronts = []
-
-specific_gens = [1, 10, 30, 70, 100, 150]
-specific_gen_data = {}
-
-# 绘制Pareto前沿的图形
-plt.figure(figsize=(10, 8))
-plt.xlabel('模型复杂度（越小越好）')
-plt.ylabel('预测误差 (RMSE, m/s)（越小越好）')
-plt.title('每一代的 Pareto 前沿')
-plt.grid(True)
-
-for generation in range(max_generations):
-    print(f'第 {generation + 1} 代进化中...')
-
-    # 评估种群性能
-    performance, complexity, rmse, mae, mape, r = evaluate_population(
-        population, train_dataset, val_dataset, min_speed, max_speed,
-        sequence_length, feature_data.shape[1]
-    )
-
-    # 记录当前代最优解（按RMSE）
-    min_idx = np.argmin(performance)
-    best_params_history[generation] = population[min_idx]
-    best_performance_history[generation] = performance[min_idx]
-    best_complexity_history[generation] = complexity[min_idx]
-
-    # 快速非支配排序
-    fronts, rank = fast_non_dominated_sort(performance, complexity)
-
-    # 拥挤度计算
-    distance = crowding_distance(performance, complexity, fronts)
-
-    # 记录Pareto前沿
-    pareto_struct = find_pareto_front(population, performance, complexity, fronts)
-    all_pareto_fronts.append(pareto_struct)
-
-    # 保存特定代数据
-    if (generation + 1) in specific_gens:  # generation是0-based
-        gen_data = {
-            'population': population,
-            'performance': performance,
-            'complexity': complexity,
-            'pareto_front': pareto_struct,
-            'rmse': rmse,
-            'mae': mae,
-            'mape': mape,
-            'r': r
-        }
-        specific_gen_data[generation + 1] = gen_data
-
-    # 绘制当前代Pareto前沿
-    if pareto_struct['num_solutions'] > 0:
-        perf_vals = pareto_struct['performance']
-        complexity_vals = pareto_struct['complexity']
-
-        # 为重叠点添加微小扰动以便可视化
-        unique_points = np.unique(np.column_stack((complexity_vals, perf_vals)), axis=0)
-        perturbed_front = []
-
-        for point in unique_points:
-            matching = np.all(np.column_stack((complexity_vals, perf_vals)) == point, axis=1)
-            num_duplicates = np.sum(matching)
-
-            if num_duplicates > 1:
-                jitter = 1e-4 * np.random.randn(num_duplicates, 2)
-                perturbed = np.tile(point, (num_duplicates, 1)) + jitter
-                perturbed_front.extend(perturbed)
-            else:
-                perturbed_front.append(point)
-
-        perturbed_front = np.array(perturbed_front)
-        plt.scatter(perturbed_front[:, 0], perturbed_front[:, 1], 36, alpha=0.6)
-        plt.pause(0.1)  # 刷新图形
-
-    print(f'第 {generation + 1} 代 Pareto 解的数量: {pareto_struct["num_solutions"]}')
-
-    # 选择算子
-    mating_pool = tournament_selection(population, rank, distance, population_size)
-
-    # 交叉
-    offspring = sbx_crossover(mating_pool, lb, ub, int_con, pc, eta_c)
-
-    # 变异
-    offspring = polynomial_mutation(offspring, lb, ub, int_con, pm, eta_m)
-
-    # 评估子代
-    offspring_performance, offspring_complexity, _, _, _, _ = evaluate_population(
-        offspring, train_dataset, val_dataset, min_speed, max_speed,
-        sequence_length, feature_data.shape[1]
-    )
-
-    # 合并父代和子代
-    combined_population = np.vstack((population, offspring))
-    combined_performance = np.hstack((performance, offspring_performance))
-    combined_complexity = np.hstack((complexity, offspring_complexity))
-
-    # 环境选择
-    combined_fronts, combined_rank = fast_non_dominated_sort(combined_performance, combined_complexity)
-    combined_distance = crowding_distance(combined_performance, combined_complexity, combined_fronts)
-
-    population, performance, complexity = environmental_selection(
-        combined_population, combined_performance, combined_complexity,
-        combined_rank, combined_distance, population_size
-    )
-
-plt.legend([f'第 {i + 1} 代' for i in range(max_generations)], loc='best')
-plt.tight_layout()
-plt.show()
-
-print('NSGA-II 优化完成。')
-
-# 绘制特定代的Pareto前沿对比
-specific_gens = [1, 5, 10, 20, 40, 60]
-plt.figure(figsize=(10, 8))
-plt.title('特定代的 Pareto 前沿对比')
-plt.xlabel('模型复杂度（越小越好）')
-plt.ylabel('预测误差 (RMSE, m/s)（越小越好）')
-plt.grid(True)
-
-colors = plt.cm.tab10(np.linspace(0, 1, len(specific_gens)))
-
-for idx, gen in enumerate(specific_gens):
-    if gen <= max_generations and (gen - 1) < len(all_pareto_fronts):
-        pareto_struct = all_pareto_fronts[gen - 1]  # 转换为0-based索引
-
-        if pareto_struct['num_solutions'] > 0:
-            perf_vals = pareto_struct['performance']
-            complexity_vals = pareto_struct['complexity']
-
-            unique_points = np.unique(np.column_stack((complexity_vals, perf_vals)), axis=0)
-            perturbed_front = []
-
-            for point in unique_points:
-                matching = np.all(np.column_stack((complexity_vals, perf_vals)) == point, axis=1)
-                num_duplicates = np.sum(matching)
-
-                if num_duplicates > 1:
-                    jitter = 1e-4 * np.random.randn(num_duplicates, 2)
-                    perturbed = np.tile(point, (num_duplicates, 1)) + jitter
-                    perturbed_front.extend(perturbed)
-                else:
-                    perturbed_front.append(point)
-
-            perturbed_front = np.array(perturbed_front)
-            plt.scatter(perturbed_front[:, 0], perturbed_front[:, 1], 36,
-                        color=colors[idx], alpha=0.6, label=f'第 {gen} 代')
-
-plt.legend(loc='best')
-plt.tight_layout()
-plt.show()
-
-# 保存优化结果
-import pickle
-
-final_pareto_struct = all_pareto_fronts[-1] if all_pareto_fronts else {'num_solutions': 0}
-
-with open('nsga2_optimization_results_extended.pkl', 'wb') as f:
-    pickle.dump({
-        'finalParetoStruct': final_pareto_struct,
-        'allParetoFronts': all_pareto_fronts,
-        'bestParamsHistory': best_params_history,
-        'bestPerformanceHistory': best_performance_history,
-        'bestComplexityHistory': best_complexity_history,
-        'specificGenData': specific_gen_data
-    }, f)
-
-print('优化结果已保存至 nsga2_optimization_results_extended.pkl')
-
-
-# 4. 最终模型训练
-# 查找所有代中最优的Pareto解
-all_valid_pareto = []
-all_valid_perf = []
-all_valid_comp = []
-
-for front in all_pareto_fronts:
-    if front['num_solutions'] > 0:
-        all_valid_pareto.extend(front['params'])
-        all_valid_perf.extend(front['performance'])
-        all_valid_comp.extend(front['complexity'])
-
-# 如果最终代没有，使用所有代的有效解
-if final_pareto_struct['num_solutions'] == 0 and all_valid_pareto:
-    final_pareto_struct = {
-        'params': np.array(all_valid_pareto),
-        'performance': np.array(all_valid_perf),
-        'complexity': np.array(all_valid_comp),
-        'num_solutions': len(all_valid_pareto)
-    }
-    print('警告：最后一代无Pareto解，使用所有代的有效Pareto解')
-
-if final_pareto_struct['num_solutions'] > 0:
-    perf_vals = final_pareto_struct['performance']
-    complexity_vals = final_pareto_struct['complexity']
-
-    # 选择折中最优解
-    normalized_perf = (perf_vals - np.min(perf_vals)) / (np.max(perf_vals) - np.min(perf_vals) + 1e-10)
-    normalized_comp = (complexity_vals - np.min(complexity_vals)) / (
-                np.max(complexity_vals) - np.min(complexity_vals) + 1e-10)
-    trade_off_scores = np.sqrt(normalized_perf ** 2 + normalized_comp ** 2)
-
-    trade_off_idx = np.argmin(trade_off_scores)
-    best_params = final_pareto_struct['params'][trade_off_idx]
-    print(f'选取Pareto前沿折中最优解（trade-off index: {trade_off_idx + 1}）。')
-else:
-    raise ValueError('最终Pareto前沿无有效解，无法选取模型。')
-
-# 解析最优超参数
-batch_size = round(best_params[0])
-learn_rate = best_params[1]
-pool_type = round(best_params[2])
-num_filters1 = round(best_params[3])
-filter_size1 = round(best_params[4])
-filter_size2 = filter_size1
-lstm_units1 = round(best_params[5])
-lstm_units2 = round(best_params[6])
-reg_type = round(best_params[7])
-dropout_prob1 = best_params[8]
-dropout_prob2 = best_params[9]
-optimizer_type = round(best_params[10])
-num_conv_layers = round(best_params[11])
-conv_dropout = best_params[12]
-activation_function = round(best_params[13])
-
-# 创建数据加载器
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size)
-test_loader = DataLoader(test_dataset, batch_size=batch_size)
-
-# 构建最终网络
-num_filters2 = max(8, num_filters1 // 2) if num_conv_layers == 2 else 0
-model_opt = CNNBiLSTM(
-    feature_data.shape[1], num_filters1, filter_size1, num_filters2, filter_size2,
-    lstm_units1, lstm_units2, pool_type, num_conv_layers,
-    dropout_prob1, dropout_prob2, conv_dropout, activation_function
-).to(device)
-
-# 定义损失函数和优化器
-criterion = nn.MSELoss()
-
-if optimizer_type == 1:
-    optimizer = optim.Adam(model_opt.parameters(), lr=learn_rate,
-                           weight_decay=1e-4 if reg_type in [1, 3] else 0)
-elif optimizer_type == 2:
-    optimizer = optim.SGD(model_opt.parameters(), lr=learn_rate, momentum=0.9,
-                          weight_decay=1e-4 if reg_type in [1, 3] else 0)
-else:  # 3
-    optimizer = optim.RMSprop(model_opt.parameters(), lr=learn_rate,
-                              weight_decay=1e-4 if reg_type in [1, 3] else 0)
-
-# 学习率调度器
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.15)
-
-# 训练模型
-best_val_loss = float('inf')
-patience = 10
-counter = 0
-train_losses = []
-val_losses = []
-
-for epoch in range(50):
-    model_opt.train()
-    train_loss = 0.0
-
-    for inputs, targets in train_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        optimizer.zero_grad()
-        outputs = model_opt(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
-
-        train_loss += loss.item() * inputs.size(0)
-
-    train_loss /= len(train_loader.dataset)
-    train_losses.append(train_loss)
-
-    # 验证
-    model_opt.eval()
-    val_loss = 0.0
+    return new_pop, np.array(new_perf), np.array(new_complex)
+
+
+# ==================== 9. 综合报告生成函数 ====================
+def generate_comprehensive_report(model, test_loader, val_loader, device, min_speed, max_speed,
+                                  all_pareto_fronts, feature_columns, topo, cnn_params, lstm_params,
+                                  setting, test_performance, r_test):
+    """
+    生成CNN-BiLSTM模型预测效果的综合报告
+    包含6个可视化子图：验证集预测、测试集预测、残差分布、误差概率密度、Pareto前沿、性能指标柱状图
+    """
+    print('\n========== 生成综合预测报告 ==========')
+
+    # 获取验证集预测结果
+    model.eval()
     all_val_targets = []
     all_val_outputs = []
-
     with torch.no_grad():
         for inputs, targets in val_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model_opt(inputs)
-            loss = criterion(outputs, targets)
-            val_loss += loss.item() * inputs.size(0)
-
+            outputs = model(inputs)
             all_val_targets.extend(targets.cpu().numpy())
             all_val_outputs.extend(outputs.cpu().numpy())
 
-    val_loss /= len(val_loader.dataset)
-    val_losses.append(val_loss)
-    scheduler.step()
+    all_val_targets = np.array(all_val_targets).flatten()
+    all_val_outputs = np.array(all_val_outputs).flatten()
+    all_val_targets = all_val_targets * (max_speed - min_speed) + min_speed
+    all_val_outputs = all_val_outputs * (max_speed - min_speed) + min_speed
 
-    print(f'Epoch {epoch + 1}/{50}, 训练损失: {train_loss:.6f}, 验证损失: {val_loss:.6f}')
-
-    # 早停机制
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        counter = 0
-        best_model_opt = deepcopy(model_opt.state_dict())
-    else:
-        counter += 1
-        if counter >= patience:
-            print(f'早停于第 {epoch + 1} 轮')
-            break
-
-# 加载最佳模型
-model_opt.load_state_dict(best_model_opt)
-model_opt.eval()
-
-# 在验证集上评估
-all_val_targets = []
-all_val_outputs = []
-
-with torch.no_grad():
-    for inputs, targets in val_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-        outputs = model_opt(inputs)
-
-        all_val_targets.extend(targets.cpu().numpy())
-        all_val_outputs.extend(outputs.cpu().numpy())
-
-# 反归一化
-all_val_targets = np.array(all_val_targets) * (max_speed - min_speed) + min_speed
-all_val_outputs = np.array(all_val_outputs) * (max_speed - min_speed) + min_speed
-
-# 计算评估指标
-mae_val_opt = mean_absolute_error(all_val_targets, all_val_outputs)
-rmse_val_opt = np.sqrt(mean_squared_error(all_val_targets, all_val_outputs))
-mape_val_opt = np.mean(np.abs((all_val_targets - all_val_outputs) / all_val_targets)) * 100
-corr_matrix_val_opt = np.corrcoef(all_val_targets.flatten(), all_val_outputs.flatten())
-r_val_opt = corr_matrix_val_opt[0, 1] if corr_matrix_val_opt.shape[0] >= 2 else 0
-
-print(f'优化模型验证集性能: MAE = {mae_val_opt:.4f} (m/s), RMSE = {rmse_val_opt:.4f} (m/s), '
-      f'MAPE = {mape_val_opt:.2f}%, R = {r_val_opt:.4f}')
-
-# 在测试集上评估
-all_test_targets = []
-all_test_outputs = []
-
-with torch.no_grad():
-    for inputs, targets in test_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-        outputs = model_opt(inputs)
-
-        all_test_targets.extend(targets.cpu().numpy())
-        all_test_outputs.extend(outputs.cpu().numpy())
-
-# 反归一化
-all_test_targets = np.array(all_test_targets) * (max_speed - min_speed) + min_speed
-all_test_outputs = np.array(all_test_outputs) * (max_speed - min_speed) + min_speed
-
-# 计算评估指标
-mae_test_opt = mean_absolute_error(all_test_targets, all_test_outputs)
-rmse_test_opt = np.sqrt(mean_squared_error(all_test_targets, all_test_outputs))
-mape_test_opt = np.mean(np.abs((all_test_targets - all_test_outputs) / all_test_targets)) * 100
-corr_matrix_test_opt = np.corrcoef(all_test_targets.flatten(), all_test_outputs.flatten())
-r_test_opt = corr_matrix_test_opt[0, 1] if corr_matrix_test_opt.shape[0] >= 2 else 0
-
-print(f'优化模型测试集性能: MAE = {mae_test_opt:.4f} (m/s), RMSE = {rmse_test_opt:.4f} (m/s), '
-      f'MAPE = {mape_test_opt:.2f}%, R = {r_test_opt:.4f}')
-
-# 学习到的特征权重
-feature_weights = model_opt.feature_weight.weights.detach().cpu().numpy()
-print('\n学习到的特征权重：')
-for i, col in enumerate(feature_columns):
-    print(f'  {col}: {feature_weights[i, 0]:.4f}')
-
-
-# 5. 基准模型对比
-print('开始基准模型对比...')
-
-# BiLSTM模型
-model_lstm = BiLSTM(feature_data.shape[1], lstm_units1, lstm_units2, dropout_prob1, dropout_prob2).to(device)
-
-criterion_lstm = nn.MSELoss()
-optimizer_lstm = optim.Adam(model_lstm.parameters(), lr=learn_rate, weight_decay=1e-4 if reg_type in [1, 3] else 0)
-scheduler_lstm = optim.lr_scheduler.StepLR(optimizer_lstm, step_size=20, gamma=0.2)
-
-best_val_loss_lstm = float('inf')
-counter_lstm = 0
-
-for epoch in range(50):
-    model_lstm.train()
-    train_loss = 0.0
-
-    for inputs, targets in train_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        optimizer_lstm.zero_grad()
-        outputs = model_lstm(inputs)
-        loss = criterion_lstm(outputs, targets)
-        loss.backward()
-        optimizer_lstm.step()
-
-        train_loss += loss.item() * inputs.size(0)
-
-    train_loss /= len(train_loader.dataset)
-
-    # 验证
-    model_lstm.eval()
-    val_loss = 0.0
-
+    # 获取测试集预测结果
+    all_test_targets = []
+    all_test_outputs = []
     with torch.no_grad():
-        for inputs, targets in val_loader:
+        for inputs, targets in test_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model_lstm(inputs)
-            loss = criterion_lstm(outputs, targets)
-            val_loss += loss.item() * inputs.size(0)
+            outputs = model(inputs)
+            all_test_targets.extend(targets.cpu().numpy())
+            all_test_outputs.extend(outputs.cpu().numpy())
 
-    val_loss /= len(val_loader.dataset)
-    scheduler_lstm.step()
+    all_test_targets = np.array(all_test_targets).flatten()
+    all_test_outputs = np.array(all_test_outputs).flatten()
+    all_test_targets = all_test_targets * (max_speed - min_speed) + min_speed
+    all_test_outputs = all_test_outputs * (max_speed - min_speed) + min_speed
 
-    if val_loss < best_val_loss_lstm:
-        best_val_loss_lstm = val_loss
-        counter_lstm = 0
-        best_model_lstm = deepcopy(model_lstm.state_dict())
+    # 计算残差
+    val_residuals = all_val_targets - all_val_outputs
+    test_residuals = all_test_targets - all_test_outputs
+
+    # 计算各项评估指标
+    mae_val = mean_absolute_error(all_val_targets, all_val_outputs)
+    rmse_val = np.sqrt(mean_squared_error(all_val_targets, all_val_outputs))
+    mape_val = np.mean(np.abs(val_residuals / all_val_targets)) * 100
+    r2_val = r2_score(all_val_targets, all_val_outputs)
+    r_val = pearsonr(all_val_targets, all_val_outputs)[0]
+
+    mae_test = test_performance['mae']
+    rmse_test = test_performance['rmse']
+    mape_test = test_performance['mape']
+    r2_test = r2_score(all_test_targets, all_test_outputs)
+    # r_test 现在作为参数传入
+
+    # 创建综合报告图像
+    fig = plt.figure(figsize=(20, 12))
+    fig.suptitle('CNN-BiLSTM 模型预测效果综合报告', fontsize=20, fontweight='bold', y=0.98)
+
+    # 子图1: 验证集预测效果
+    ax1 = plt.subplot(2, 3, 1)
+    sample_idx = np.arange(0, min(500, len(all_val_targets)))
+    ax1.plot(sample_idx, all_val_targets[sample_idx], 'b-', linewidth=1.5, label='真实值', alpha=0.8)
+    ax1.plot(sample_idx, all_val_outputs[sample_idx], 'r--', linewidth=1.5, label='预测值', alpha=0.8)
+    ax1.set_xlabel('时间步', fontsize=12)
+    ax1.set_ylabel('风速 (m/s)', fontsize=12)
+    ax1.set_title(f'验证集预测效果\n(RMSE={rmse_val:.3f}, MAE={mae_val:.3f})', fontsize=14)
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+
+    # 子图2: 测试集预测效果
+    ax2 = plt.subplot(2, 3, 2)
+    sample_idx = np.arange(0, min(500, len(all_test_targets)))
+    ax2.plot(sample_idx, all_test_targets[sample_idx], 'b-', linewidth=1.5, label='真实值', alpha=0.8)
+    ax2.plot(sample_idx, all_test_outputs[sample_idx], 'r--', linewidth=1.5, label='预测值', alpha=0.8)
+    ax2.set_xlabel('时间步', fontsize=12)
+    ax2.set_ylabel('风速 (m/s)', fontsize=12)
+    ax2.set_title(f'测试集预测效果\n(RMSE={rmse_test:.3f}, MAE={mae_test:.3f})', fontsize=14)
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+
+    # 子图3: 测试集残差分布
+    ax3 = plt.subplot(2, 3, 3)
+    ax3.hist(test_residuals, bins=50, color='darkcyan', alpha=0.7, edgecolor='black')
+    ax3.axvline(x=np.mean(test_residuals), color='red', linestyle='--', linewidth=2,
+                label=f'均值: {np.mean(test_residuals):.3f}')
+    ax3.set_xlabel('残差 (真实值 - 预测值)', fontsize=12)
+    ax3.set_ylabel('频数', fontsize=12)
+    ax3.set_title('测试集残差分布', fontsize=14)
+    ax3.legend(loc='best')
+    ax3.grid(True, alpha=0.3)
+
+    # 子图4: 测试集误差概率密度
+    ax4 = plt.subplot(2, 3, 4)
+    ax4.hist(test_residuals, bins=50, density=True, color='steelblue', alpha=0.7, edgecolor='black')
+    ax4.axvline(x=0, color='red', linestyle='--', linewidth=2, label='零误差线')
+    ax4.set_xlabel('预测误差 (m/s)', fontsize=12)
+    ax4.set_ylabel('概率密度', fontsize=12)
+    ax4.set_title('测试集误差概率密度', fontsize=14)
+    ax4.legend(loc='best')
+    ax4.grid(True, alpha=0.3)
+
+    # 子图5: 最后一代Pareto前沿
+    ax5 = plt.subplot(2, 3, 5)
+    final_pareto = all_pareto_fronts[-1]
+    if final_pareto['num_solutions'] > 0:
+        perf_vals = final_pareto['performance']
+        comp_vals = final_pareto['complexity']
+        valid_mask = np.isfinite(perf_vals) & np.isfinite(comp_vals)
+        if np.any(valid_mask):
+            ax5.scatter(comp_vals[valid_mask], perf_vals[valid_mask],
+                        c='darkgreen', s=100, edgecolors='black', linewidth=1, alpha=0.8)
+    ax5.set_xlabel('模型复杂度 (参数数量)', fontsize=12)
+    ax5.set_ylabel('验证集 RMSE (m/s)', fontsize=12)
+    ax5.set_title('最后一代Pareto前沿', fontsize=14)
+    ax5.grid(True, alpha=0.3)
+
+    # 子图6: 各项性能指标对比
+    ax6 = plt.subplot(2, 3, 6)
+    metrics = ['RMSE', 'MAE', 'MAPE', 'R²']
+    test_metrics = [rmse_test, mae_test, mape_test, r2_test]
+
+    x = np.arange(len(metrics))
+    width = 0.35
+
+    bars2 = ax6.bar(x + width / 2, test_metrics, width, label='测试集', color='darkcyan', alpha=0.8)
+
+    ax6.set_xlabel('评估指标', fontsize=12)
+    ax6.set_ylabel('指标值', fontsize=12)
+    ax6.set_title('性能指标对比', fontsize=14)
+    ax6.set_xticks(x)
+    ax6.set_xticklabels(metrics)
+    ax6.legend(loc='best')
+    ax6.grid(True, alpha=0.3)
+
+    # 在柱状图上显示数值
+    def add_value_labels(ax, bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3),
+                        textcoords="offset points",
+                        ha='center', va='bottom', fontsize=9)
+
+    add_value_labels(ax6, bars2)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig('comprehensive_cnn_bilstm_report.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # 特征权重可视化
+    if isinstance(model, nn.DataParallel):
+        feature_weights = model.module.feature_weights.detach().cpu().numpy()
     else:
-        counter_lstm += 1
-        if counter_lstm >= patience:
-            break
+        feature_weights = model.feature_weights.detach().cpu().numpy()
 
-# 在测试集上评估BiLSTM
-model_lstm.load_state_dict(best_model_lstm)
-model_lstm.eval()
+    plt.figure(figsize=(10, 6))
+    weights = feature_weights.flatten()
+    plt.bar(range(len(feature_columns)), weights, color=[0.2, 0.5, 0.8])
+    plt.xticks(range(len(feature_columns)), feature_columns, rotation=15)
+    plt.xlabel('输入特征')
+    plt.ylabel('学习到的权重（越大越重要）')
+    plt.title('HybridCNNBiLSTM 中各输入特征的权重')
+    plt.grid(True, axis='y')
+    for i, w in enumerate(weights):
+        plt.text(i, w + 0.02, f'{w:.4f}', ha='center', fontsize=9)
+    plt.tight_layout()
+    plt.savefig('feature_weights.png', dpi=300)
+    plt.show()
 
-all_test_outputs_lstm = []
+    # 打印详细报告
+    print('\n========== 详细性能报告 ==========')
+    print(f'验证集性能:')
+    print(f'  MAE: {mae_val:.4f} m/s')
+    print(f'  RMSE: {rmse_val:.4f} m/s')
+    print(f'  MAPE: {mape_val:.2f}%')
+    print(f'  R²: {r2_val:.4f}')
+    print(f'  相关系数: {r_val:.4f}')
 
-with torch.no_grad():
-    for inputs, targets in test_loader:
-        inputs = inputs.to(device)
-        outputs = model_lstm(inputs)
-        all_test_outputs_lstm.extend(outputs.cpu().numpy())
+    print(f'\n测试集性能:')
+    print(f'  MAE: {mae_test:.4f} m/s')
+    print(f'  RMSE: {rmse_test:.4f} m/s')
+    print(f'  MAPE: {mape_test:.2f}%')
+    print(f'  R²: {r2_test:.4f}')
+    print(f'  相关系数: {r_test:.4f}')
 
-# 反归一化
-all_test_outputs_lstm = np.array(all_test_outputs_lstm) * (max_speed - min_speed) + min_speed
+    print(f'\n特征重要性排名:')
+    feature_importance = sorted(zip(feature_columns, weights), key=lambda x: x[1], reverse=True)
+    for i, (feature, weight) in enumerate(feature_importance, 1):
+        print(f'  {i}. {feature}: {weight:.4f}')
 
-# 计算评估指标
-mae_test_lstm = mean_absolute_error(all_test_targets, all_test_outputs_lstm)
-rmse_test_lstm = np.sqrt(mean_squared_error(all_test_targets, all_test_outputs_lstm))
-mape_test_lstm = np.mean(np.abs((all_test_targets - all_test_outputs_lstm) / all_test_targets)) * 100
-corr_matrix_test_lstm = np.corrcoef(all_test_targets.flatten(), all_test_outputs_lstm.flatten())
-r_test_lstm = corr_matrix_test_lstm[0, 1] if corr_matrix_test_lstm.shape[0] >= 2 else 0
+    print('\n综合报告已生成并保存！')
+    return {
+        'val_metrics': {'mae': mae_val, 'rmse': rmse_val, 'mape': mape_val, 'r2': r2_val, 'r': r_val},
+        'test_metrics': {'mae': mae_test, 'rmse': rmse_test, 'mape': mape_test, 'r2': r2_test, 'r': r_test}
+    }
 
-print(f'BiLSTM模型测试集性能: MAE = {mae_test_lstm:.4f}, RMSE = {rmse_test_lstm:.4f}, '
-      f'MAPE = {mae_test_lstm:.2f}%, R = {r_test_lstm:.4f}')
 
-# GRU模型
-model_gru = GRU(feature_data.shape[1], lstm_units1, lstm_units2, dropout_prob1, dropout_prob2).to(device)
+# ==================== 10. 主程序 ====================
+if __name__ == '__main__':
+    POP_SIZE = 20
+    MAX_GEN =40
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-criterion_gru = nn.MSELoss()
-optimizer_gru = optim.Adam(model_gru.parameters(), lr=learn_rate, weight_decay=1e-4 if reg_type in [1, 3] else 0)
-scheduler_gru = optim.lr_scheduler.StepLR(optimizer_gru, step_size=20, gamma=0.2)
+    if torch.cuda.device_count() > 1:
+        print(f'检测到 {torch.cuda.device_count()} 块GPU,将使用多GPU并行')
+    print(f'使用设备: {device}')
 
-best_val_loss_gru = float('inf')
-counter_gru = 0
+    print('\n========== 开始NSGA-II优化MODEO-CNN ==========')
+    print('基于PyTorch实现,无TensorFlow依赖')
+    print('【改进】学习率采用连续优化,范围:[0.0001, 0.01]')
+    start_time = time.time()
 
-for epoch in range(50):
-    model_gru.train()
-    train_loss = 0.0
+    population = initialize_population(POP_SIZE)
+    print(f'初始化完成,种群大小: {len(population)}')
 
-    for inputs, targets in train_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
+    best_rmse_history = []
+    best_complexity_history = []
+    all_pareto_fronts = []
 
-        optimizer_gru.zero_grad()
-        outputs = model_gru(inputs)
-        loss = criterion_gru(outputs, targets)
-        loss.backward()
-        optimizer_gru.step()
+    mutation_prob = 0.09
 
-        train_loss += loss.item() * inputs.size(0)
+    for gen in range(MAX_GEN):
+        print(f'\n第 {gen + 1}/{MAX_GEN} 代...')
 
-    train_loss /= len(train_loader.dataset)
+        performance, complexity = evaluate_population(
+            population, train_dataset, val_dataset, min_speed, max_speed, len(feature_columns), sequence_length, device
+        )
 
-    # 验证
-    model_gru.eval()
-    val_loss = 0.0
+        fronts, rank = fast_non_dominated_sort(performance, complexity)
+        distance = crowding_distance(performance, complexity, fronts)
+        mating_pool = tournament_selection(population, rank, distance, POP_SIZE)
+        offspring = crossover_population(mating_pool)
 
+        mutated_offspring = []
+        for child in offspring:
+            if np.random.random() < mutation_prob:
+                mutated_child = variable_length_mutation(child)
+                mutated_offspring.append(mutated_child)
+            else:
+                mutated_offspring.append(child.copy())
+
+        offspring_perf, offspring_comp = evaluate_population(
+            mutated_offspring, train_dataset, val_dataset, min_speed, max_speed, len(feature_columns), sequence_length,
+            device
+        )
+
+        combined_pop = population + mutated_offspring
+        combined_perf = np.concatenate([performance, offspring_perf])
+        combined_comp = np.concatenate([complexity, offspring_comp])
+
+        combined_fronts, combined_rank = fast_non_dominated_sort(combined_perf, combined_comp)
+        combined_dist = crowding_distance(combined_perf, combined_comp, combined_fronts)
+
+        # ==================== 修复精英策略：从选择后的种群提取Pareto前沿 ====================
+        # 环境选择：从2N中选择N个个体组成新一代
+        population, performance, complexity = environmental_selection(
+            combined_pop, combined_perf, combined_comp, combined_rank, combined_dist, POP_SIZE
+        )
+
+        # 对新一代重新排序，提取真实Pareto前沿
+        new_fronts, _ = fast_non_dominated_sort(performance, complexity)
+
+        # 正确记录Pareto前沿（来自N种群而非2N）
+        pareto_front = {
+            'params': [population[i] for i in new_fronts[0]],
+            'performance': performance[new_fronts[0]],
+            'complexity': complexity[new_fronts[0]],
+            'num_solutions': len(new_fronts[0]),
+            'generation': gen + 1
+        }
+        all_pareto_fronts.append(pareto_front)
+        # ===================================================================================
+
+        valid_perf = combined_perf[np.isfinite(combined_perf)]
+        if len(valid_perf) > 0:
+            best_idx_combined = np.argmin(combined_perf)
+            print(f' 合并种群Pareto解数量: {len(combined_fronts[0])}, 最优RMSE: {combined_perf[best_idx_combined]:.4f}')
+
+        valid_perf = performance[np.isfinite(performance)]
+        if len(valid_perf) > 0:
+            best_idx = np.argmin(performance)
+            best_rmse_history.append(performance[best_idx])
+            best_complexity_history.append(complexity[best_idx])
+        else:
+            best_rmse_history.append(float('inf'))
+            best_complexity_history.append(float('inf'))
+
+    end_time = time.time()
+    print(f'\n优化完成!总耗时: {end_time - start_time:.2f} 秒 ({(end_time - start_time) / 60:.2f} 分钟)')
+
+    final_pareto = all_pareto_fronts[-1]
+    if final_pareto['num_solutions'] > 0:
+        perf_vals = final_pareto['performance']
+        comp_vals = final_pareto['complexity']
+        valid_mask = np.isfinite(perf_vals) & np.isfinite(comp_vals)
+        if valid_mask.any():
+            perf_vals = perf_vals[valid_mask]
+            comp_vals = comp_vals[valid_mask]
+            params = [final_pareto['params'][i] for i in range(len(valid_mask)) if valid_mask[i]]
+            normalized_perf = (perf_vals - perf_vals.min()) / (perf_vals.max() - perf_vals.min() + 1e-10)
+            normalized_comp = (comp_vals - comp_vals.min()) / (comp_vals.max() - comp_vals.min() + 1e-10)
+            trade_off_scores = np.sqrt(normalized_perf ** 2 + normalized_comp ** 2)
+            best_idx = np.argmin(trade_off_scores)
+            best_individual = params[best_idx]
+        else:
+            all_perf = np.concatenate([pf['performance'] for pf in all_pareto_fronts])
+            all_params = [p for pf in all_pareto_fronts for p in pf['params']]
+            valid_mask = np.isfinite(all_perf)
+            if valid_mask.any():
+                best_idx = np.argmin(all_perf[valid_mask])
+                best_individual = np.array(all_params)[valid_mask][best_idx]
+            else:
+                raise ValueError("所有个体评估均失败!")
+    else:
+        all_perf = np.concatenate([pf['performance'] for pf in all_pareto_fronts])
+        all_params = [p for pf in all_pareto_fronts for p in pf['params']]
+        valid_mask = np.isfinite(all_perf)
+        if valid_mask.any():
+            best_idx = np.argmin(all_perf[valid_mask])
+            best_individual = np.array(all_params)[valid_mask][best_idx]
+        else:
+            raise ValueError("所有个体评估均失败!")
+
+    topo, cnn_params, lstm_params, setting = decode_individual(best_individual)
+    batch_size, learn_rate, opt_type, reg_type = decode_hyperparams(setting)
+
+    print(f'\n最终优化的超参数数值:')
+    print(f' batch_size: {batch_size}')
+    print(f' learning_rate: {learn_rate:.6f}')
+    print(f' optimizer: {opt_type}')
+    print(f' regularizer: {reg_type}')
+
+    print(f'\n模型拓扑结构:')
+    print(f' topo: {topo}')
+    print(f' cnn_params: {cnn_params}')
+    print(f' lstm_params: {lstm_params}')
+
+    print(f'\n最后一代Pareto前沿的每个解:')
+    for i in range(final_pareto['num_solutions']):
+        ind = final_pareto['params'][i]
+        perf = final_pareto['performance'][i]
+        comp = final_pareto['complexity'][i]
+        topo, cnn_params, lstm_params, setting = decode_individual(ind)
+        batch_size, learn_rate, opt_type, reg_type = decode_hyperparams(setting)
+        print(f' 解 {i + 1}:')
+        print(f'   Pareto坐标: RMSE = {perf:.4f}, Complexity = {comp}')
+        print(f'   拓扑结构: {topo}')
+        print(f'   CNN参数: {cnn_params}')
+        print(f'   LSTM参数: {lstm_params}')
+        print(
+            f'   设置参数: batch_size={batch_size}, learning_rate={learn_rate:.6f}, optimizer={opt_type}, regularizer={reg_type}')
+
+    print('\n训练最终模型...')
+    model = HybridCNNBiLSTM(topo, cnn_params, lstm_params, len(feature_columns), sequence_length).to(device)
+
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    criterion = nn.MSELoss()
+
+    if opt_type == 'Adam':
+        optimizer = optim.Adam(model.parameters(), lr=learn_rate)
+    elif opt_type == 'SGD':
+        optimizer = optim.SGD(model.parameters(), lr=learn_rate, momentum=0.9)
+    elif opt_type == 'RMSprop':
+        optimizer = optim.RMSprop(model.parameters(), lr=learn_rate)
+    else:
+        optimizer = optim.Adadelta(model.parameters(), lr=learn_rate)
+
+    # 训练循环，添加早停设置，patience=10
+    best_val_loss = float('inf')
+    patience_counter = 0
+    patience = 20
+    for epoch in range(400):
+        model.train()
+        train_loss = 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        # 计算验证损失
+        model.eval()
+        val_loss = 0
+        val_samples = 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                batch_loss = criterion(outputs, targets).item() * inputs.size(0)
+                val_loss += batch_loss
+                val_samples += inputs.size(0)
+        if val_samples > 0:
+            val_loss /= val_samples
+
+        if (epoch + 1) % 50 == 0:
+            print(f'  Epoch {epoch + 1}/2000,训练损失: {train_loss / len(train_loader):.6f}, 验证损失: {val_loss:.6f}')
+
+        # 早停检查
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'早停于 epoch {epoch + 1}')
+                break
+
+    # 评估最终模型
+    model.eval()
+    all_test_targets = []
+    all_test_outputs = []
     with torch.no_grad():
-        for inputs, targets in val_loader:
+        for inputs, targets in test_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model_gru(inputs)
-            loss = criterion_gru(outputs, targets)
-            val_loss += loss.item() * inputs.size(0)
+            outputs = model(inputs)
+            all_test_targets.extend(targets.cpu().numpy())
+            all_test_outputs.extend(outputs.cpu().numpy())
 
-    val_loss /= len(val_loader.dataset)
-    scheduler_gru.step()
+    all_test_targets = np.array(all_test_targets) * (max_speed - min_speed) + min_speed
+    all_test_outputs = np.array(all_test_outputs) * (max_speed - min_speed) + min_speed
+    all_test_targets = all_test_targets.flatten()
+    all_test_outputs = all_test_outputs.flatten()
 
-    if val_loss < best_val_loss_gru:
-        best_val_loss_gru = val_loss
-        counter_gru = 0
-        best_model_gru = deepcopy(model_gru.state_dict())
+    mae_test = mean_absolute_error(all_test_targets, all_test_outputs)
+    rmse_test = np.sqrt(mean_squared_error(all_test_targets, all_test_outputs))
+    mape_test = np.mean(np.abs((all_test_targets - all_test_outputs) / all_test_targets)) * 100
+
+    # 计算R²
+    r2_test = r2_score(all_test_targets, all_test_outputs)
+
+    r_test = pearsonr(all_test_targets, all_test_outputs)[0]
+
+    print(f'\n测试集最终性能:')
+    print(f' MAE: {mae_test:.4f} m/s')
+    print(f' RMSE: {rmse_test:.4f} m/s')
+    print(f' MAPE: {mape_test:.2f}%')
+    print(f' R²: {r2_test:.4f}')
+    print(f' 相关系数: {r_test:.4f}')
+
+    # Pareto前沿演化图
+    print('\n正在绘制 Pareto 前沿演化图...')
+    plt.figure(figsize=(12, 8))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(all_pareto_fronts)))
+
+    for idx, pf in enumerate(all_pareto_fronts):
+        if pf['num_solutions'] > 0:
+            perf = pf['performance']
+            comp = pf['complexity']
+            valid_mask = np.isfinite(perf) & np.isfinite(comp)
+            if np.any(valid_mask):
+                plt.scatter(comp[valid_mask], perf[valid_mask],
+                            c=[colors[idx]], s=60, alpha=0.6,
+                            label=f'第 {pf["generation"]} 代', edgecolors='k', linewidth=0.5)
+
+    plt.xlabel('模型复杂度 (参数数量)', fontsize=14)
+    plt.ylabel('验证集 RMSE (m/s)', fontsize=14)
+    plt.title('NSGA-II Pareto 前沿演化过程', fontsize=16)
+    plt.legend(fontsize=10, loc='upper right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('pareto_evolution_continuous_lr.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    # ==================== 新增：绘制指定代数的Pareto前沿对比图（带连接线） ====================
+    print('\n正在绘制关键代数Pareto前沿对比图（第1, 5, 10, 20, 40, 60代）...')
+
+    # 定义要绘制的目标代数
+    target_generations = [1,5,10,20,40,60]
+
+    # 创建图形
+    plt.figure(figsize=(14, 10))
+
+    # 为每个代数定义不同的颜色和标记
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+    markers = ['o', 's', '^', 'D', 'v', 'p']
+
+    plotted_any = False
+    for idx, target_gen in enumerate(target_generations):
+        # 检查该代数是否存在
+        pf = None
+        for front in all_pareto_fronts:
+            if front['generation'] == target_gen:
+                pf = front
+                break
+
+        if pf is None or pf['num_solutions'] == 0:
+            print(f'  警告: 第 {target_gen} 代数据不存在或无有效解')
+            continue
+
+        # 获取该代的Pareto前沿数据
+        perf = pf['performance']
+        comp = pf['complexity']
+
+        # 过滤无效值
+        valid_mask = np.isfinite(perf) & np.isfinite(comp)
+        if not np.any(valid_mask):
+            print(f'  警告: 第 {target_gen} 代无有效数据')
+            continue
+
+        perf = perf[valid_mask]
+        comp = comp[valid_mask]
+
+        # 按复杂度排序，确保连线顺序正确
+        sort_idx = np.argsort(comp)
+        comp_sorted = comp[sort_idx]
+        perf_sorted = perf[sort_idx]
+
+        # 绘制带连线的Pareto前沿（实线+散点）
+        plt.plot(comp_sorted, perf_sorted,
+                 color=colors[idx],
+                 linewidth=2,
+                 alpha=0.7,
+                 label=f'第 {target_gen} 代 (n={len(perf)})')
+
+        # 叠加散点标记，使点更明显
+        plt.scatter(comp, perf,
+                    c=colors[idx],
+                    marker=markers[idx],
+                    s=80,
+                    alpha=0.9,
+                    edgecolors='black',
+                    linewidth=0.5)
+
+        plotted_any = True
+
+    if not plotted_any:
+        print("警告：没有找到任何指定代数的有效Pareto前沿数据！")
     else:
-        counter_gru += 1
-        if counter_gru >= patience:
+        plt.xlabel('模型复杂度 (参数数量)', fontsize=14)
+        plt.ylabel('验证集 RMSE (m/s)', fontsize=14)
+        plt.title('NSGA-II Pareto前沿进化过程对比（带连接线）', fontsize=16, fontweight='bold')
+        plt.legend(fontsize=11, loc='upper right')
+        plt.grid(True, alpha=0.3)
+
+        # 添加文字说明
+        plt.figtext(0.5, 0.02,
+                    '注：第1代为初始种群，第10代为最终进化结果\n每条实线连接该代的所有Pareto最优解，展示前沿面形状',
+                    ha='center', fontsize=10, style='italic')
+
+        plt.tight_layout(rect=[0, 0.05, 1, 0.96])
+
+        # 保存图像
+        evolution_comparison_path = 'pareto_evolution_comparison_connected.png'
+        plt.savefig(evolution_comparison_path, dpi=300, bbox_inches='tight')
+        print(f'带连接线的Pareto前沿对比图已保存：{evolution_comparison_path}')
+        plt.show()
+
+    print('\n正在绘制最终代Pareto前沿详细图（第10代）...')
+    final_pf = None
+    for pf in all_pareto_fronts:
+        if pf['generation'] == 60:
+            final_pf = pf
             break
 
-# 在测试集上评估GRU
-model_gru.load_state_dict(best_model_gru)
-model_gru.eval()
-
-all_test_outputs_gru = []
-
-with torch.no_grad():
-    for inputs, targets in test_loader:
-        inputs = inputs.to(device)
-        outputs = model_gru(inputs)
-        all_test_outputs_gru.extend(outputs.cpu().numpy())
-
-# 反归一化
-all_test_outputs_gru = np.array(all_test_outputs_gru) * (max_speed - min_speed) + min_speed
-
-# 计算评估指标
-mae_test_gru = mean_absolute_error(all_test_targets, all_test_outputs_gru)
-rmse_test_gru = np.sqrt(mean_squared_error(all_test_targets, all_test_outputs_gru))
-mape_test_gru = np.mean(np.abs((all_test_targets - all_test_outputs_gru) / all_test_targets)) * 100
-corr_matrix_test_gru = np.corrcoef(all_test_targets.flatten(), all_test_outputs_gru.flatten())
-r_test_gru = corr_matrix_test_gru[0, 1] if corr_matrix_test_gru.shape[0] >= 2 else 0
-
-print(f'GRU模型测试集性能: MAE = {mae_test_gru:.4f}, RMSE = {rmse_test_gru:.4f}, '
-      f'MAPE = {mape_test_gru:.2f}%, R = {r_test_gru:.4f}')
-
-# CNN模型
-num_filters_cnn1 = max(8, num_filters1 // 2)
-num_filters_cnn2 = max(8, num_filters_cnn1 // 2)
-model_cnn = CNN(feature_data.shape[1], num_filters_cnn1, filter_size1, num_filters_cnn2, filter_size1).to(device)
-
-criterion_cnn = nn.MSELoss()
-optimizer_cnn = optim.Adam(model_cnn.parameters(), lr=learn_rate, weight_decay=1e-4 if reg_type in [1, 3] else 0)
-scheduler_cnn = optim.lr_scheduler.StepLR(optimizer_cnn, step_size=20, gamma=0.15)
-
-best_val_loss_cnn = float('inf')
-counter_cnn = 0
-
-for epoch in range(50):
-    model_cnn.train()
-    train_loss = 0.0
-
-    for inputs, targets in train_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        optimizer_cnn.zero_grad()
-        outputs = model_cnn(inputs)
-        loss = criterion_cnn(outputs, targets)
-        loss.backward()
-        optimizer_cnn.step()
-
-        train_loss += loss.item() * inputs.size(0)
-
-    train_loss /= len(train_loader.dataset)
-
-    # 验证
-    model_cnn.eval()
-    val_loss = 0.0
-
-    with torch.no_grad():
-        for inputs, targets in val_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model_cnn(inputs)
-            loss = criterion_cnn(outputs, targets)
-            val_loss += loss.item() * inputs.size(0)
-
-    val_loss /= len(val_loader.dataset)
-    scheduler_cnn.step()
-
-    if val_loss < best_val_loss_cnn:
-        best_val_loss_cnn = val_loss
-        counter_cnn = 0
-        best_model_cnn = deepcopy(model_cnn.state_dict())
-    else:
-        counter_cnn += 1
-        if counter_cnn >= patience:
-            break
-
-# 在测试集上评估CNN
-model_cnn.load_state_dict(best_model_cnn)
-model_cnn.eval()
-
-all_test_outputs_cnn = []
-
-with torch.no_grad():
-    for inputs, targets in test_loader:
-        inputs = inputs.to(device)
-        outputs = model_cnn(inputs)
-        all_test_outputs_cnn.extend(outputs.cpu().numpy())
-
-# 反归一化
-all_test_outputs_cnn = np.array(all_test_outputs_cnn) * (max_speed - min_speed) + min_speed
-
-# 计算评估指标
-mae_test_cnn = mean_absolute_error(all_test_targets, all_test_outputs_cnn)
-rmse_test_cnn = np.sqrt(mean_squared_error(all_test_targets, all_test_outputs_cnn))
-mape_test_cnn = np.mean(np.abs((all_test_targets - all_test_outputs_cnn) / all_test_targets)) * 100
-corr_matrix_test_cnn = np.corrcoef(all_test_targets.flatten(), all_test_outputs_cnn.flatten())
-r_test_cnn = corr_matrix_test_cnn[0, 1] if corr_matrix_test_cnn.shape[0] >= 2 else 0
-
-print(f'CNN模型测试集性能: MAE = {mae_test_cnn:.4f}, RMSE = {rmse_test_cnn:.4f}, '
-      f'MAPE = {mape_test_cnn:.2f}%, R = {r_test_cnn:.4f}')
-
-# Transformer模型
-embedding_dim = 64
-num_heads = 4
-ffn_dim = 128
-seq_len = sequence_length
-
-model_transformer = TransformerModel(feature_data.shape[1], embedding_dim, num_heads, ffn_dim, seq_len).to(device)
-
-criterion_transformer = nn.MSELoss()
-optimizer_transformer = optim.Adam(model_transformer.parameters(), lr=5e-5, weight_decay=1e-4)
-scheduler_transformer = optim.lr_scheduler.StepLR(optimizer_transformer, step_size=15, gamma=0.5)
-
-best_val_loss_transformer = float('inf')
-counter_transformer = 0
-
-print('开始训练标准Transformer模型...')
-for epoch in range(50):
-    model_transformer.train()
-    train_loss = 0.0
-
-    for inputs, targets in train_loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        optimizer_transformer.zero_grad()
-        outputs = model_transformer(inputs)
-        loss = criterion_transformer(outputs, targets)
-        loss.backward()
-        optimizer_transformer.step()
-
-        train_loss += loss.item() * inputs.size(0)
-
-    train_loss /= len(train_loader.dataset)
-
-    # 验证
-    model_transformer.eval()
-    val_loss = 0.0
-
-    with torch.no_grad():
-        for inputs, targets in val_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model_transformer(inputs)
-            loss = criterion_transformer(outputs, targets)
-            val_loss += loss.item() * inputs.size(0)
-
-    val_loss /= len(val_loader.dataset)
-    scheduler_transformer.step()
-
-    if val_loss < best_val_loss_transformer:
-        best_val_loss_transformer = val_loss
-        counter_transformer = 0
-        best_model_transformer = deepcopy(model_transformer.state_dict())
-    else:
-        counter_transformer += 1
-        if counter_transformer >= patience:
-            break
-
-# 在测试集上评估Transformer
-model_transformer.load_state_dict(best_model_transformer)
-model_transformer.eval()
-
-all_test_outputs_transformer = []
-
-with torch.no_grad():
-    for inputs, targets in test_loader:
-        inputs = inputs.to(device)
-        outputs = model_transformer(inputs)
-        all_test_outputs_transformer.extend(outputs.cpu().numpy())
-
-# 反归一化
-all_test_outputs_transformer = np.array(all_test_outputs_transformer) * (max_speed - min_speed) + min_speed
-
-# 计算评估指标
-mae_test_transformer = mean_absolute_error(all_test_targets, all_test_outputs_transformer)
-rmse_test_transformer = np.sqrt(mean_squared_error(all_test_targets, all_test_outputs_transformer))
-mape_test_transformer = np.mean(np.abs((all_test_targets - all_test_outputs_transformer) / all_test_targets)) * 100
-corr_matrix_test_transformer = np.corrcoef(all_test_targets.flatten(), all_test_outputs_transformer.flatten())
-r_test_transformer = corr_matrix_test_transformer[0, 1] if corr_matrix_test_transformer.shape[0] >= 2 else 0
-
-print(f'标准Transformer模型测试集性能: MAE = {mae_test_transformer:.4f}, RMSE = {rmse_test_transformer:.4f}, '
-      f'MAPE = {mape_test_transformer:.2f}%, R = {r_test_transformer:.4f}')
-
-
-# 6. 可视化分析
-plt.figure(figsize=(16, 12))
-plt.suptitle('最终模型 - 预测分析', fontsize=16)
-
-# 验证集预测效果
-plt.subplot(2, 3, 1)
-plt.plot(all_val_targets, 'b-', linewidth=1.5, label='验证集真实值')
-plt.plot(all_val_outputs, 'r--', linewidth=1.5, label='优化模型预测')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.title(f'验证集预测效果 (RMSE={rmse_val_opt:.3f})')
-plt.legend(loc='best')
-plt.grid(True)
-
-# 测试集预测效果
-plt.subplot(2, 3, 2)
-plt.plot(all_test_targets, 'b-', linewidth=1.5, label='测试集真实值')
-plt.plot(all_test_outputs, 'r--', linewidth=1.5, label='优化模型预测')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.title(f'测试集预测效果 (RMSE={rmse_test_opt:.3f})')
-plt.legend(loc='best')
-plt.grid(True)
-
-# 测试集误差分布
-plt.subplot(2, 3, 3)
-errors_test_opt = all_test_targets - all_test_outputs
-plt.hist(errors_test_opt, 30, density=True, alpha=0.7)
-plt.xlabel('预测误差 (m/s)')
-plt.ylabel('概率密度')
-plt.title(f'测试集误差分布 (均值={np.mean(errors_test_opt):.3f})')
-plt.grid(True)
-
-# 预测 vs 真实
-plt.subplot(2, 3, 4)
-plt.scatter(all_test_targets, all_test_outputs, 50, alpha=0.6)
-plt.plot([all_test_targets.min(), all_test_targets.max()],
-         [all_test_targets.min(), all_test_targets.max()], 'k--', linewidth=2)
-plt.xlabel('真实值 (m/s)')
-plt.ylabel('预测值 (m/s)')
-plt.title(f'预测 vs 真实 (R={r_test_opt:.3f})')
-plt.grid(True)
-plt.axis('equal')
-plt.tight_layout()
-
-# 不同模型测试集性能对比
-plt.subplot(2, 3, 5)
-metrics = ['MAE', 'RMSE', 'MAPE', 'R']
-opt_metrics = [mae_test_opt, rmse_test_opt, mape_test_opt, r_test_opt]
-lstm_metrics = [mae_test_lstm, rmse_test_lstm, mape_test_lstm, r_test_lstm]
-gru_metrics = [mae_test_gru, rmse_test_gru, mape_test_gru, r_test_gru]
-cnn_metrics = [mae_test_cnn, rmse_test_cnn, mape_test_cnn, r_test_cnn]
-transformer_metrics = [mae_test_transformer, rmse_test_transformer, mape_test_transformer, r_test_transformer]
-
-x = np.arange(len(metrics))
-width = 0.15
-
-plt.bar(x - 2 * width, opt_metrics, width, label='优化CNN-BiLSTM')
-plt.bar(x - width, lstm_metrics, width, label='BiLSTM')
-plt.bar(x, gru_metrics, width, label='GRU')
-plt.bar(x + width, cnn_metrics, width, label='CNN')
-plt.bar(x + 2 * width, transformer_metrics, width, label='轻量级Transformer')
-
-plt.xticks(x, metrics)
-plt.ylabel('指标值')
-plt.title('不同模型测试集性能对比')
-plt.legend(loc='best')
-plt.grid(True, axis='y')
-
-# 优化模型测试集绝对误差时间序列
-plt.subplot(2, 3, 6)
-plt.plot(np.abs(errors_test_opt), 'g-', linewidth=1)
-plt.xlabel('时间步')
-plt.ylabel('绝对误差 (m/s)')
-plt.title('优化模型测试集绝对误差时间序列')
-plt.grid(True)
-
-mean_abs_error = np.mean(np.abs(errors_test_opt))
-std_abs_error = np.std(np.abs(errors_test_opt))
-plt.axhline(mean_abs_error, color='r', linestyle='--',
-            label=f'均值={mean_abs_error:.3f}')
-plt.axhline(mean_abs_error + std_abs_error, color='r', linestyle=':',
-            label=f'+1σ={mean_abs_error + std_abs_error:.3f}')
-plt.axhline(max(0, mean_abs_error - std_abs_error), color='r', linestyle=':',
-            label=f'-1σ={max(0, mean_abs_error - std_abs_error):.3f}')
-plt.legend(loc='best')
-
-plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.show()
-
-# 7. 特征权重可视化
-plt.figure(figsize=(10, 6))
-weights = feature_weights.flatten()
-plt.bar(range(len(feature_columns)), weights, color=[0.2, 0.5, 0.8])
-plt.xticks(range(len(feature_columns)), feature_columns, rotation=15)
-plt.xlabel('输入特征')
-plt.ylabel('学习到的权重（越大越重要）')
-plt.title('优化模型中各输入特征的权重')
-plt.grid(True, axis='y')
-
-for i, w in enumerate(weights):
-    plt.text(i, w + 0.02, f'{w:.4f}', ha='center', fontsize=9)
-
-plt.tight_layout()
-plt.show()
-
-# 8. 模型预测对比
-plt.figure(figsize=(16, 10))
-plt.suptitle('各模型预测 vs 真实值', fontsize=16)
-
-# 优化模型
-plt.subplot(2, 3, 1)
-plt.plot(all_test_targets, 'b-', linewidth=1.5, label='真实值')
-plt.plot(all_test_outputs, 'r--', linewidth=1.5, label='优化模型')
-plt.title('优化模型预测 vs 真实')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.legend(loc='best')
-plt.grid(True)
-
-# BiLSTM
-plt.subplot(2, 3, 2)
-plt.plot(all_test_targets, 'b-', linewidth=1.5, label='真实值')
-plt.plot(all_test_outputs_lstm, 'g--', linewidth=1.5, label='BiLSTM')
-plt.title('BiLSTM预测 vs 真实')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.legend(loc='best')
-plt.grid(True)
-
-# GRU
-plt.subplot(2, 3, 3)
-plt.plot(all_test_targets, 'b-', linewidth=1.5, label='真实值')
-plt.plot(all_test_outputs_gru, 'm--', linewidth=1.5, label='GRU')
-plt.title('GRU预测 vs 真实')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.legend(loc='best')
-plt.grid(True)
-
-# CNN
-plt.subplot(2, 3, 4)
-plt.plot(all_test_targets, 'b-', linewidth=1.5, label='真实值')
-plt.plot(all_test_outputs_cnn, 'c--', linewidth=1.5, label='CNN')
-plt.title('CNN预测 vs 真实')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.legend(loc='best')
-plt.grid(True)
-
-# Transformer
-plt.subplot(2, 3, 5)
-plt.plot(all_test_targets, 'b-', linewidth=1.5, label='真实值')
-plt.plot(all_test_outputs_transformer, 'y--', linewidth=1.5, label='轻量级Transformer')
-plt.title('轻量级Transformer预测 vs 真实')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.legend(loc='best')
-plt.grid(True)
-
-# 所有模型对比
-plt.subplot(2, 3, 6)
-plt.plot(all_test_targets, 'k-', linewidth=2, label='真实值')
-plt.plot(all_test_outputs, 'r--', linewidth=1, label='优化模型')
-plt.plot(all_test_outputs_lstm, 'g--', linewidth=1, label='BiLSTM')
-plt.plot(all_test_outputs_gru, 'm--', linewidth=1, label='GRU')
-plt.plot(all_test_outputs_cnn, 'c--', linewidth=1, label='CNN')
-plt.plot(all_test_outputs_transformer, 'y--', linewidth=1, label='轻量级Transformer')
-plt.title('所有模型预测对比')
-plt.xlabel('时间步')
-plt.ylabel('风速 (m/s)')
-plt.legend(loc='best')
-plt.grid(True)
-
-plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.show()
-
-# 9. 打印优化后的超参数
-param_names = ['Batch Size', 'Learn Rate', 'Pool Type',
-               'Num Filters1', 'Filter Size1', 'LSTM Units1',
-               'LSTM Units2', 'Reg Type', 'Dropout Prob1', 'Dropout Prob2',
-               'OptimizerType', 'NumConvLayers', 'ConvDropout', 'ActivationFunction']
-
-print('\n=== 最终优化的超参数 ===')
-for i, name in enumerate(param_names):
-    if i in int_con:
-        print(f'{name}: {round(best_params[i])}')
-    else:
-        print(f'{name}: {best_params[i]:.6f}')
-
-# 10. 生成优化摘要报告
-print('\n=== NSGA-II 优化摘要报告 ===')
-print(f'总进化代数: {max_generations}')
-print(f'种群大小: {population_size}')
-print(f'最终Pareto解数量: {final_pareto_struct["num_solutions"]}')
-print(f'初始最优RMSE: {best_performance_history[0]:.4f} (m/s)')
-print(f'最终最优RMSE: {best_performance_history[-1]:.4f} (m/s)')
-if best_performance_history[0] > 0:
-    improvement = (best_performance_history[0] - best_performance_history[-1]) / best_performance_history[0] * 100
-    print(f'性能改进: {improvement:.2f}%')
-
-print('\n=== 最终模型测试集性能 ===')
-print(f'优化模型: MAE={mae_test_opt:.4f}, RMSE={rmse_test_opt:.4f}, MAPE={mape_test_opt:.2f}%, R={r_test_opt:.4f}')
-
-print('\n=== 基准模型测试集性能对比 ===')
-print(
-    f'BiLSTM模型: MAE={mae_test_lstm:.4f}, RMSE={rmse_test_lstm:.4f}, MAPE={mae_test_lstm:.2f}%, R={r_test_lstm:.4f}')
-print(f'GRU模型: MAE={mae_test_gru:.4f}, RMSE={rmse_test_gru:.4f}, MAPE={mape_test_gru:.2f}%, R={r_test_gru:.4f}')
-print(f'CNN模型: MAE={mae_test_cnn:.4f}, RMSE={rmse_test_cnn:.4f}, MAPE={mape_test_cnn:.2f}%, R={r_test_cnn:.4f}')
-print(
-    f'轻量级Transformer模型: MAE={mae_test_transformer:.4f}, RMSE={rmse_test_transformer:.4f}, MAPE={mape_test_transformer:.2f}%, R={r_test_transformer:.4f}')
-
-print('\n可视化图表已生成。')
-print('优化完成！所有结果已保存至 nsga2_optimization_results_extended.pkl')
+    if final_pf and final_pf['num_solutions'] > 0:
+        perf_final = final_pf['performance']
+        comp_final = final_pf['complexity']
+        valid_final = np.isfinite(perf_final) & np.isfinite(comp_final)
+
+        if np.any(valid_final):
+            perf_final = perf_final[valid_final]
+            comp_final = comp_final[valid_final]
+
+            # 按复杂度排序
+            sort_idx = np.argsort(comp_final)
+            comp_sorted = comp_final[sort_idx]
+            perf_sorted = perf_final[sort_idx]
+
+            plt.figure(figsize=(12, 8))
+            plt.plot(comp_sorted, perf_sorted,
+                     color='darkred', linewidth=3, alpha=0.8,
+                     marker='o', markersize=10, markerfacecolor='red',
+                     markeredgecolor='black', markeredgewidth=1.5)
+
+            plt.xlabel('模型复杂度 (参数数量)', fontsize=14)
+            plt.ylabel('验证集 RMSE (m/s)', fontsize=14)
+            plt.title('最终Pareto前沿（第10代）', fontsize=16, fontweight='bold')
+            plt.grid(True, alpha=0.3)
+
+            # 在点上标注数值
+            for i, (comp_val, perf_val) in enumerate(zip(comp_sorted, perf_sorted)):
+                plt.annotate(f'({comp_val:.0f}, {perf_val:.3f})',
+                             xy=(comp_val, perf_val),
+                             xytext=(5, 5), textcoords='offset points',
+                             fontsize=9, alpha=0.7)
+
+            plt.tight_layout()
+            plt.savefig('pareto_front_final_gen10.png', dpi=300, bbox_inches='tight')
+            plt.show()
+
+    # 保存结果
+    test_performance = {'mae': mae_test, 'rmse': rmse_test, 'mape': mape_test}
+
+    with open('modeo_cnn_optimization_continuous_lr.pkl', 'wb') as f:
+        pickle.dump({
+            'best_individual': best_individual,
+            'best_rmse_history': best_rmse_history,
+            'pareto_fronts': all_pareto_fronts,
+            'test_performance': test_performance,
+            'model_params': {
+                'topo': topo,
+                'cnn_params': cnn_params,
+                'lstm_params': lstm_params,
+                'setting': setting,
+                'batch_size': batch_size,
+                'learn_rate': learn_rate,
+                'opt_type': opt_type
+            }
+        }, f)
+
+    # 生成综合报告
+    report_metrics = generate_comprehensive_report(
+        model, test_loader, val_loader, device, min_speed, max_speed,
+        all_pareto_fronts, feature_columns, topo, cnn_params, lstm_params,
+        setting, test_performance, r_test
+    )
+
+    print('\n========== 优化完成!所有结果已保存 ==========')
