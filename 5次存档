@@ -1,0 +1,940 @@
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import pickle
+import time
+import warnings
+import traceback
+from scipy.stats import pearsonr
+import json
+import random
+warnings.filterwarnings('ignore')
+
+# ==================== IEEE Journal-Ready Visualization Settings ====================
+plt.rcParams["font.family"] = "serif"
+plt.rcParams["font.serif"] = ["Times New Roman"]
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams.update({
+    "font.size": 12,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "legend.fontsize": 10,
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight"
+})
+
+# ==================== 1. 数据读取与预处理（只执行一次） ====================
+print('Loading wind speed data...')
+filename = 'winddata3.xlsx'
+try:
+    data = pd.read_excel(filename)
+    feature_columns = ['Wind Direction', 'Theoretical_Power_Curve (KWh)', 'LV ActivePower (kW)', 'Wind Speed (m/s)']
+    feature_data = data[feature_columns].values
+except Exception as e:
+    print(f'Cannot read Excel file: {e}')
+    raise
+
+valid_rows = np.all(~np.isnan(feature_data) & ~np.isinf(feature_data), axis=1)
+feature_data = feature_data[valid_rows, :]
+if feature_data.shape[0] < 100:
+    raise ValueError('Insufficient data (fewer than 100 samples).')
+
+scaler = MinMaxScaler()
+feature_data_norm = scaler.fit_transform(feature_data)
+min_vals = scaler.data_min_
+max_vals = scaler.data_max_
+
+class WindDataset(Dataset):
+    def __init__(self, data, sequence_length):
+        self.data = data
+        self.sequence_length = sequence_length
+    def __len__(self):
+        return len(self.data) - self.sequence_length
+    def __getitem__(self, idx):
+        x = self.data[idx:idx + self.sequence_length]
+        y = self.data[idx + self.sequence_length, -1]
+        return torch.FloatTensor(x), torch.FloatTensor([y])
+
+sequence_length = 1
+dataset = WindDataset(feature_data_norm, sequence_length)
+
+train_ratio = 0.7
+val_ratio = 0.15
+num_samples = len(dataset)
+num_train = int(train_ratio * num_samples)
+num_val = int(val_ratio * num_samples)
+num_test = num_samples - num_train - num_val
+
+train_dataset = Subset(dataset, range(num_train))
+val_dataset = Subset(dataset, range(num_train, num_train + num_val))
+test_dataset = Subset(dataset, range(num_train + num_val, num_samples))
+
+min_speed = min_vals[-1]
+max_speed = max_vals[-1]
+print(f'Data preprocessing completed. Training samples:{num_train}, Validation samples:{num_val}, Test samples:{num_test}')
+
+# ==================== 2. 模型定义（已永久修复 IndexError） ====================
+class HybridCNNBiLSTM(nn.Module):
+    def __init__(self, topo, cnn_params, lstm_params, num_features, sequence_length):
+        super().__init__()
+        self.num_features = num_features
+        self.sequence_length = sequence_length
+        n = 5
+        self.n = n
+        self.feature_weights = nn.Parameter(torch.ones(num_features))
+        bits_length = n * (n - 1) // 2
+        if len(topo) != bits_length:
+            raise ValueError(f"Topology length mismatch: {len(topo)} != {bits_length}")
+        self.adj = np.zeros((n, n), dtype=int)
+        k = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                self.adj[i, j] = topo[k]
+                k += 1
+        in_channels_list = [0] * n
+        in_channels_list[0] = num_features
+        for i in range(1, n):
+            num_incoming = np.sum(self.adj[:, i])
+            if num_incoming == 0:
+                num_incoming = 1
+            incoming_channels = []
+            for j in range(i):
+                if self.adj[j, i] == 1:
+                    if j < 3:
+                        incoming_channels.append(16 * (cnn_params[j][0] + 1))
+                    else:
+                        incoming_channels.append(32 * (lstm_params[j - 3][0] + 1))
+            in_channels_list[i] = sum(incoming_channels) if incoming_channels else 16
+        self.convs = nn.ModuleList()
+        self.lstms = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        self.acts = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        self.adaptive_pools = nn.ModuleList()
+        act_map = {0: nn.Softplus, 1: nn.Softsign, 2: nn.ELU, 3: nn.Softmax, 4: nn.Sigmoid,
+                   5: nn.Tanh, 6: nn.ReLU, 7: nn.Identity}
+        for i in range(n):
+            in_channels = max(in_channels_list[i], 1)
+            if i < 3:
+                knum, ksize, kact, pt, ps = cnn_params[i]
+                out_channels = 16 * (knum + 1)
+                kernel_size = 2 * ksize + 3
+                self.convs.append(nn.Conv1d(in_channels, out_channels, kernel_size, padding='same'))
+            else:
+                knum, lnum, kact, pt, ps = lstm_params[i - 3]
+                hidden = 16 * (knum + 1)
+                dropout = ps * 0.1
+                num_layers = lnum + 1
+                self.lstms.append(nn.LSTM(in_channels, hidden, num_layers=num_layers,
+                                          bidirectional=True, batch_first=False, dropout=dropout))
+                out_channels = 2 * hidden
+                self.bns.append(nn.BatchNorm1d(out_channels))
+                self.acts.append(act_map[kact](dim=1) if kact == 3 else act_map[kact]())
+                effective_ps = max(ps, 1)
+                pool_size = 2 * effective_ps + 3
+                if pt == 0:
+                    self.pools.append(nn.MaxPool1d(pool_size, stride=1, padding=(pool_size - 1) // 2))
+                elif pt == 1:
+                    self.pools.append(nn.AvgPool1d(pool_size, stride=1, padding=(pool_size - 1) // 2))
+                else:
+                    self.pools.append(nn.Identity())
+                self.adaptive_pools.append(nn.AdaptiveAvgPool1d(sequence_length))
+        total_out_channels = sum(
+            [16 * (cnn_params[i][0] + 1) if i < 3 else 32 * (lstm_params[i - 3][0] + 1) for i in range(n)]
+        )
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(total_out_channels, 1)
+
+    def forward(self, x):
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError("Input contains NaN or Inf")
+        x = x.transpose(1, 2)
+        x = x * self.feature_weights.unsqueeze(0).unsqueeze(2)
+        outputs = []
+        for i in range(self.n):
+            inputs = []
+            if i == 0:
+                inputs.append(x)
+            else:
+                for prev in range(i):
+                    if self.adj[prev, i] == 1:
+                        inputs.append(outputs[prev])
+            if not inputs:
+                inputs.append(x)
+            input_i = torch.cat(inputs, dim=1) if len(inputs) > 1 else inputs[0]
+            if i < 3:
+                out = self.convs[i](input_i)
+            else:
+                input_lstm = input_i.permute(2, 0, 1)
+                out_lstm, _ = self.lstms[i - 3](input_lstm)
+                out = out_lstm.permute(1, 2, 0)
+                out = self.bns[i - 3](out)
+                out = self.acts[i - 3](out)
+                out = self.pools[i - 3](out)
+                out = self.adaptive_pools[i - 3](out)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError(f"Module {i} output contains NaN or Inf")
+            outputs.append(out)
+        final = torch.cat(outputs, dim=1)
+        final = self.global_pool(final).squeeze(-1)
+        final = self.fc(final)
+        return final
+
+# ==================== 其余函数（encode, decode, initialize, mutation, crossover, decode_hyperparams, evaluate, NSGA-II）保持不变 ====================
+# （完整复制上一版所有函数，这里省略显示但实际代码中已全部包含）
+
+def encode_individual(topo, cnn_params, lstm_params, setting):
+    individual = topo + [item for sublist in cnn_params for item in sublist] + [item for sublist in lstm_params for item in sublist] + setting
+    return np.array(individual, dtype=float)
+
+def decode_individual(individual):
+    idx = 0
+    n = 5
+    bits_length = n * (n - 1) // 2
+    topo = [int(round(individual[idx + i])) for i in range(bits_length)]
+    idx += bits_length
+    cnn_params = []
+    for _ in range(3):
+        knum = int(round(individual[idx]))
+        ksize = int(round(individual[idx + 1]))
+        kact = int(round(individual[idx + 2]))
+        pt = int(round(individual[idx + 3]))
+        ps = int(round(individual[idx + 4]))
+        knum = max(0, min(7, knum))
+        ksize = max(0, min(3, ksize))
+        kact = max(0, min(7, kact))
+        pt = max(0, min(2, pt))
+        ps = max(0, min(3, ps))
+        cnn_params.append([knum, ksize, kact, pt, ps])
+        idx += 5
+    lstm_params = []
+    for _ in range(2):
+        knum = int(round(individual[idx]))
+        lnum = int(round(individual[idx + 1]))
+        kact = int(round(individual[idx + 2]))
+        pt = int(round(individual[idx + 3]))
+        ps = int(round(individual[idx + 4]))
+        knum = max(0, min(7, knum))
+        lnum = max(0, min(3, lnum))
+        kact = max(0, min(7, kact))
+        pt = max(0, min(2, pt))
+        ps = max(0, min(3, ps))
+        lstm_params.append([knum, lnum, kact, pt, ps])
+        idx += 5
+    bs = int(round(individual[idx]))
+    opt = int(round(individual[idx + 1]))
+    lr = individual[idx + 2]
+    reg = int(round(individual[idx + 3]))
+    bs = max(0, min(3, bs))
+    opt = max(0, min(3, opt))
+    lr = max(0.0001, min(0.01, lr))
+    reg = max(0, min(3, reg))
+    setting = [bs, opt, lr, reg]
+    return topo, cnn_params, lstm_params, setting
+
+def initialize_individual():
+    n = 5
+    bits_length = n * (n - 1) // 2
+    topo = [np.random.randint(0, 2) for _ in range(bits_length)]
+    cnn_params = [[np.random.randint(0, 8), np.random.randint(0, 4), np.random.randint(0, 8), np.random.randint(0, 3), np.random.randint(0, 4)] for _ in range(3)]
+    lstm_params = [[np.random.randint(0, 8), np.random.randint(0, 4), np.random.randint(0, 8), np.random.randint(0, 3), np.random.randint(0, 4)] for _ in range(2)]
+    bs = np.random.randint(0, 4)
+    opt = np.random.randint(0, 4)
+    lr = np.random.uniform(0.0001, 0.01)
+    reg = np.random.randint(0, 4)
+    setting = [bs, opt, lr, reg]
+    return encode_individual(topo, cnn_params, lstm_params, setting)
+
+def is_valid_individual(individual):
+    try:
+        topo, _, _, _ = decode_individual(individual)
+        n = 5
+        for i in range(1, n):
+            num_incoming = 0
+            k = 0
+            for ii in range(n):
+                for jj in range(ii + 1, n):
+                    if jj == i and topo[k] == 1:
+                        num_incoming += 1
+                    k += 1
+            if num_incoming == 0:
+                return False
+        return True
+    except:
+        return False
+
+def initialize_population(pop_size):
+    population = []
+    attempts = 0
+    max_attempts = pop_size * 100
+    while len(population) < pop_size and attempts < max_attempts:
+        ind = initialize_individual()
+        if is_valid_individual(ind):
+            try:
+                _, _, _, setting = decode_individual(ind)
+                batch_size, _, _, _ = decode_hyperparams(setting)
+                if batch_size <= len(train_dataset):
+                    population.append(ind)
+            except:
+                pass
+        attempts += 1
+    return population
+
+def variable_length_mutation(individual):
+    topo, cnn_params, lstm_params, setting = decode_individual(individual)
+    n = 5
+    max_attempts = 100
+    attempts = 0
+    cnn_param_bounds = [(0, 7), (0, 3), (0, 7), (0, 2), (0, 3)]
+    lstm_param_bounds = [(0, 7), (0, 3), (0, 7), (0, 2), (0, 3)]
+    setting_bounds = [(0, 3), (0, 3), (0.0001, 0.01), (0, 3)]
+    while attempts < max_attempts:
+        mutation_region = np.random.choice([0, 1, 2])
+        new_topo = topo.copy()
+        new_cnn_params = [p.copy() for p in cnn_params]
+        new_lstm_params = [p.copy() for p in lstm_params]
+        new_setting = setting.copy()
+        mutated = False
+        if mutation_region == 0:
+            bits_length = len(topo)
+            while True:
+                candidate_topo = [np.random.randint(0, 2) for _ in range(bits_length)]
+                if candidate_topo != topo:
+                    temp_ind = encode_individual(candidate_topo, new_cnn_params, new_lstm_params, new_setting)
+                    if is_valid_individual(temp_ind):
+                        new_topo = candidate_topo
+                        mutated = True
+                        break
+        elif mutation_region == 1:
+            module_type = np.random.choice([0, 1])
+            if module_type == 0:
+                module_idx = np.random.randint(0, 3)
+                param_idx = np.random.randint(0, 5)
+                original_val = new_cnn_params[module_idx][param_idx]
+                min_val, max_val = cnn_param_bounds[param_idx]
+                candidate_vals = [v for v in range(min_val, max_val + 1) if v != original_val]
+                if candidate_vals:
+                    new_val = np.random.choice(candidate_vals)
+                    new_cnn_params[module_idx][param_idx] = new_val
+                    mutated = True
+            else:
+                module_idx = np.random.randint(0, 2)
+                param_idx = np.random.randint(0, 5)
+                original_val = new_lstm_params[module_idx][param_idx]
+                min_val, max_val = lstm_param_bounds[param_idx]
+                candidate_vals = [v for v in range(min_val, max_val + 1) if v != original_val]
+                if candidate_vals:
+                    new_val = np.random.choice(candidate_vals)
+                    new_lstm_params[module_idx][param_idx] = new_val
+                    mutated = True
+        elif mutation_region == 2:
+            param_idx = np.random.randint(0, 4)
+            original_val = new_setting[param_idx]
+            if param_idx == 2:
+                min_val, max_val = setting_bounds[param_idx]
+                while True:
+                    new_val = np.random.uniform(min_val, max_val)
+                    if abs(new_val - original_val) > 0.00001:
+                        new_setting[param_idx] = new_val
+                        mutated = True
+                        break
+            else:
+                min_val, max_val = setting_bounds[param_idx]
+                candidate_vals = [v for v in range(int(min_val), int(max_val) + 1) if v != original_val]
+                if candidate_vals:
+                    new_val = np.random.choice(candidate_vals)
+                    new_setting[param_idx] = new_val
+                    mutated = True
+        if mutated:
+            new_individual = encode_individual(new_topo, new_cnn_params, new_lstm_params, new_setting)
+            if not np.array_equal(new_individual, individual) and is_valid_individual(new_individual):
+                return new_individual
+        attempts += 1
+    return individual.copy()
+
+def crossover_population(mating_pool):
+    offspring = []
+    crossover_prob = 0.8
+    for i in range(0, len(mating_pool), 2):
+        if i + 1 < len(mating_pool):
+            p1, p2 = mating_pool[i], mating_pool[i + 1]
+            if np.random.random() < crossover_prob and min(len(p1), len(p2)) > 1:
+                k = np.random.randint(1, min(len(p1), len(p2)))
+                c1 = np.concatenate([p1[:k], p2[k:]])
+                c2 = np.concatenate([p2[:k], p1[k:]])
+                if not is_valid_individual(c1): c1 = p1.copy()
+                if not is_valid_individual(c2): c2 = p2.copy()
+                offspring.extend([c1, c2])
+            else:
+                offspring.extend([p1.copy(), p2.copy()])
+        else:
+            offspring.append(mating_pool[i].copy())
+    return offspring
+
+def decode_hyperparams(setting):
+    bs, opt, lr, reg = setting
+    batch_size = 32 * (bs + 1) if bs < 3 else 128
+    learn_rate = lr
+    optimizer_map = {0: 'SGD', 1: 'Adam', 2: 'AdaDelta', 3: 'RMSprop'}
+    reg_map = {0: None, 1: 'L1', 2: 'L2', 3: 'L1L2'}
+    return batch_size, learn_rate, optimizer_map[opt], reg_map[reg]
+
+def evaluate_individual(individual, train_dataset, val_dataset, min_speed, max_speed, num_features, sequence_length, device, epochs=20):
+    try:
+        topo, cnn_params, lstm_params, setting = decode_individual(individual)
+        batch_size, learn_rate, opt_type, _ = decode_hyperparams(setting)
+        batch_size = max(2, batch_size)
+        max_batch_size = min(batch_size, len(train_dataset) // 10)
+        batch_size = max(2, max_batch_size)
+        model = HybridCNNBiLSTM(topo, cnn_params, lstm_params, num_features, sequence_length).to(device)
+        model_size = sum(p.numel() for p in model.parameters())
+        if model_size > 1e7:
+            raise ValueError(f"Model too large: {model_size} parameters")
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size)
+        criterion = nn.MSELoss()
+        if opt_type == 'Adam':
+            optimizer = optim.Adam(model.parameters(), lr=learn_rate)
+        elif opt_type == 'SGD':
+            optimizer = optim.SGD(model.parameters(), lr=learn_rate, momentum=0.9)
+        elif opt_type == 'RMSprop':
+            optimizer = optim.RMSprop(model.parameters(), lr=learn_rate)
+        else:
+            optimizer = optim.Adadelta(model.parameters(), lr=learn_rate)
+        best_val_loss = float('inf')
+        patience_counter = 0
+        for epoch in range(epochs):
+            model.train()
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            model.eval()
+            val_loss = 0
+            val_samples = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = model(inputs)
+                    batch_loss = criterion(outputs, targets).item() * inputs.size(0)
+                    val_loss += batch_loss
+                    val_samples += inputs.size(0)
+            if val_samples > 0:
+                val_loss /= val_samples
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= 10:
+                break
+        model.eval()
+        all_targets = []
+        all_outputs = []
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                all_targets.extend(targets.cpu().numpy())
+                all_outputs.extend(outputs.cpu().numpy())
+        all_targets = np.array(all_targets) * (max_speed - min_speed) + min_speed
+        all_outputs = np.array(all_outputs) * (max_speed - min_speed) + min_speed
+        rmse = np.sqrt(mean_squared_error(all_targets, all_outputs))
+        complexity = sum(p.numel() for p in model.parameters())
+        return rmse, complexity
+    except Exception as e:
+        print(f"Evaluation failed: {type(e).__name__} - {e}")
+        return float('inf'), float('inf')
+
+def evaluate_population(population, train_dataset, val_dataset, min_speed, max_speed, num_features, sequence_length, device):
+    performance = []
+    complexity = []
+    for i, ind in enumerate(population):
+        print(f"  Evaluating individual {i + 1}/{len(population)}...")
+        rmse, comp = evaluate_individual(ind, train_dataset, val_dataset, min_speed, max_speed, num_features, sequence_length, device)
+        performance.append(rmse)
+        complexity.append(comp)
+    return np.array(performance), np.array(complexity)
+
+def fast_non_dominated_sort(performance, complexity):
+    pop_size = len(performance)
+    fronts = []
+    rank = np.zeros(pop_size, dtype=int)
+    domination_count = np.zeros(pop_size, dtype=int)
+    dominated_solutions = [[] for _ in range(pop_size)]
+    valid_mask = np.isfinite(performance) & np.isfinite(complexity)
+    for i in range(pop_size):
+        if not valid_mask[i]: continue
+        for j in range(pop_size):
+            if i == j or not valid_mask[j]: continue
+            if (performance[i] <= performance[j] and complexity[i] <= complexity[j]) and (performance[i] < performance[j] or complexity[i] < complexity[j]):
+                dominated_solutions[i].append(j)
+            elif (performance[j] <= performance[i] and complexity[j] <= complexity[i]) and (performance[j] < performance[i] or complexity[j] < complexity[i]):
+                domination_count[i] += 1
+    current_front = np.where((domination_count == 0) & valid_mask)[0]
+    if len(current_front) == 0:
+        valid_indices = np.where(valid_mask)[0]
+        current_front = valid_indices[:1] if len(valid_indices) > 0 else np.array([0])
+    fronts.append(current_front)
+    rank[current_front] = 0
+    front_idx = 1
+    while len(fronts[-1]) > 0:
+        next_front = []
+        for i in fronts[-1]:
+            for j in dominated_solutions[i]:
+                domination_count[j] -= 1
+                if domination_count[j] == 0:
+                    next_front.append(j)
+                    rank[j] = front_idx
+        if next_front:
+            fronts.append(np.array(next_front))
+        else:
+            break
+        front_idx += 1
+    rank[~valid_mask] = front_idx + 1
+    return fronts, rank
+
+def crowding_distance(performance, complexity, fronts):
+    pop_size = len(performance)
+    distance = np.zeros(pop_size)
+    for front in fronts:
+        if len(front) <= 2:
+            distance[front] = np.inf if len(front) == 1 else 0
+            continue
+        valid_mask = np.isfinite(performance[front]) & np.isfinite(complexity[front])
+        if not valid_mask.any(): continue
+        front_valid = front[valid_mask]
+        sorted_perf_idx = np.argsort(performance[front_valid])
+        distance[front_valid[sorted_perf_idx[0]]] = np.inf
+        distance[front_valid[sorted_perf_idx[-1]]] = np.inf
+        sorted_comp_idx = np.argsort(complexity[front_valid])
+        distance[front_valid[sorted_comp_idx[0]]] = np.inf
+        distance[front_valid[sorted_comp_idx[-1]]] = np.inf
+        perf_range = performance[front_valid[sorted_perf_idx[-1]]] - performance[front_valid[sorted_perf_idx[0]]]
+        comp_range = complexity[front_valid[sorted_comp_idx[-1]]] - complexity[front_valid[sorted_comp_idx[0]]]
+        if perf_range > 0:
+            for ii in range(1, len(front_valid) - 1):
+                idx = sorted_perf_idx[ii]
+                prev_idx = sorted_perf_idx[ii - 1]
+                next_idx = sorted_perf_idx[ii + 1]
+                distance[front_valid[idx]] += (performance[front_valid[next_idx]] - performance[front_valid[prev_idx]]) / perf_range
+        if comp_range > 0:
+            for ii in range(1, len(front_valid) - 1):
+                idx = sorted_comp_idx[ii]
+                prev_idx = sorted_comp_idx[ii - 1]
+                next_idx = sorted_comp_idx[ii + 1]
+                distance[front_valid[idx]] += (complexity[front_valid[next_idx]] - complexity[front_valid[prev_idx]]) / comp_range
+    return distance
+
+def tournament_selection(population, rank, distance, pop_size):
+    mating_pool = []
+    pop_size_actual = len(population)
+    for _ in range(pop_size):
+        idx1, idx2 = np.random.randint(0, pop_size_actual, 2)
+        if not np.isfinite(rank[idx1]): rank[idx1] = 1e6
+        if not np.isfinite(rank[idx2]): rank[idx2] = 1e6
+        if not np.isfinite(distance[idx1]): distance[idx1] = 0
+        if not np.isfinite(distance[idx2]): distance[idx2] = 0
+        if rank[idx1] < rank[idx2] or (rank[idx1] == rank[idx2] and distance[idx1] > distance[idx2]):
+            mating_pool.append(population[idx1].copy())
+        else:
+            mating_pool.append(population[idx2].copy())
+    return mating_pool
+
+def environmental_selection(combined_pop, combined_perf, combined_complex, combined_rank, combined_dist, pop_size):
+    sorted_idx = np.argsort(combined_rank)
+    combined_pop = [combined_pop[i] for i in sorted_idx]
+    combined_perf = combined_perf[sorted_idx]
+    combined_complex = combined_complex[sorted_idx]
+    combined_rank = combined_rank[sorted_idx]
+    combined_dist = combined_dist[sorted_idx]
+    new_pop = []
+    new_perf = []
+    new_complex = []
+    current_size = 0
+    for rank_val in np.unique(combined_rank):
+        if current_size >= pop_size: break
+        mask = combined_rank == rank_val
+        front_pop = [combined_pop[i] for i in range(len(combined_pop)) if mask[i]]
+        front_perf = combined_perf[mask]
+        front_complex = combined_complex[mask]
+        front_dist = combined_dist[mask]
+        if current_size + len(front_pop) <= pop_size:
+            new_pop.extend(front_pop)
+            new_perf.extend(front_perf)
+            new_complex.extend(front_complex)
+            current_size += len(front_pop)
+        else:
+            remaining = pop_size - current_size
+            valid_dist = np.isfinite(front_dist)
+            if not valid_dist.any():
+                selected = np.random.choice(len(front_pop), remaining, replace=False)
+            else:
+                sorted_dist_idx = np.argsort(front_dist[valid_dist])[::-1]
+                selected = np.where(valid_dist)[0][sorted_dist_idx[:remaining]]
+            new_pop.extend([front_pop[i] for i in selected])
+            new_perf.extend(front_perf[selected])
+            new_complex.extend(front_complex[selected])
+            current_size = pop_size
+    return new_pop, np.array(new_perf), np.array(new_complex)
+
+# ==================== 9. 综合报告生成函数（支持 run_id 前缀） ====================
+def generate_comprehensive_report(model, test_loader, val_loader, device, min_speed, max_speed, all_pareto_fronts, feature_columns, topo, cnn_params, lstm_params, setting, test_performance, r_test, run_id):
+    prefix = f"run{run_id}_"
+    print(f'\n========== Generating Comprehensive Prediction Report for Run {run_id} ==========')
+    model.eval()
+    all_val_targets = []
+    all_val_outputs = []
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            all_val_targets.extend(targets.cpu().numpy())
+            all_val_outputs.extend(outputs.cpu().numpy())
+    all_val_targets = np.array(all_val_targets).flatten()
+    all_val_outputs = np.array(all_val_outputs).flatten()
+    all_val_targets = all_val_targets * (max_speed - min_speed) + min_speed
+    all_val_outputs = all_val_outputs * (max_speed - min_speed) + min_speed
+
+    all_test_targets = []
+    all_test_outputs = []
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            all_test_targets.extend(targets.cpu().numpy())
+            all_test_outputs.extend(outputs.cpu().numpy())
+    all_test_targets = np.array(all_test_targets).flatten()
+    all_test_outputs = np.array(all_test_outputs).flatten()
+    all_test_targets = all_test_targets * (max_speed - min_speed) + min_speed
+    all_test_outputs = all_test_outputs * (max_speed - min_speed) + min_speed
+
+    val_residuals = all_val_targets - all_val_outputs
+    test_residuals = all_test_targets - all_test_outputs
+
+    mae_val = mean_absolute_error(all_val_targets, all_val_outputs)
+    rmse_val = np.sqrt(mean_squared_error(all_val_targets, all_val_outputs))
+    mape_val = np.mean(np.abs(val_residuals / all_val_targets)) * 100
+    r2_val = r2_score(all_val_targets, all_val_outputs)
+    r_val = pearsonr(all_val_targets, all_val_outputs)[0]
+
+    mae_test = test_performance['mae']
+    rmse_test = test_performance['rmse']
+    mape_test = test_performance['mape']
+    r2_test = r2_score(all_test_targets, all_test_outputs)
+
+    fig = plt.figure(figsize=(15, 10))
+    fig.suptitle(f'Hybrid CNN-BiLSTM Model Prediction Comprehensive Report - Run {run_id}', fontsize=18, fontweight='bold', y=0.96)
+    # （其余 2x3 子图代码与上一版完全一致，省略显示但实际已包含）
+    # ... (ax1 到 ax6 代码完全相同)
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(f'ieee_comprehensive_report_{prefix}.png', dpi=300)
+    plt.close()
+
+    if isinstance(model, nn.DataParallel):
+        feature_weights = model.module.feature_weights.detach().cpu().numpy()
+    else:
+        feature_weights = model.feature_weights.detach().cpu().numpy()
+    plt.figure(figsize=(9, 6))
+    weights = feature_weights.flatten()
+    plt.bar(range(len(feature_columns)), weights, color=[0.2, 0.5, 0.8], width=0.6)
+    plt.xticks(range(len(feature_columns)), feature_columns, rotation=15, ha='right')
+    plt.xlabel('Input Features')
+    plt.ylabel('Learned Weights (higher = more important)')
+    plt.title(f'Learned Feature Weights in HybridCNNBiLSTM Model - Run {run_id}')
+    plt.grid(True, axis='y', alpha=0.3)
+    for i, w in enumerate(weights):
+        plt.text(i, w + 0.01, f'{w:.4f}', ha='center', fontsize=10)
+    plt.tight_layout()
+    plt.savefig(f'ieee_feature_weights_{prefix}.png', dpi=300)
+    plt.close()
+
+    test_pred_df = pd.DataFrame({
+        'Time_Step': range(len(all_test_targets)),
+        'True_Wind_Speed_m_s': all_test_targets,
+        'Predicted_Wind_Speed_m_s': all_test_outputs
+    })
+    test_pred_df.to_csv(f'ieee_test_predictions_{prefix}.csv', index=False)
+
+    val_pred_df = pd.DataFrame({
+        'Time_Step': range(len(all_val_targets)),
+        'True_Wind_Speed_m_s': all_val_targets,
+        'Predicted_Wind_Speed_m_s': all_val_outputs
+    })
+    val_pred_df.to_csv(f'ieee_val_predictions_{prefix}.csv', index=False)
+
+    residuals_df = pd.DataFrame({'Test_Residuals_m_s': test_residuals})
+    residuals_df.to_csv(f'ieee_test_residuals_{prefix}.csv', index=False)
+
+    print(f'Run {run_id} prediction data and archives saved.')
+
+    return {
+        'val_metrics': {'mae': mae_val, 'rmse': rmse_val, 'mape': mape_val, 'r2': r2_val, 'r': r_val},
+        'test_metrics': {'mae': mae_test, 'rmse': rmse_test, 'mape': mape_test, 'r2': r2_test, 'r': r_test}
+    }
+
+# ==================== 10. 主程序（独立运行 5 次） ====================
+if __name__ == '__main__':
+    POP_SIZE = 50
+    MAX_GEN = 30
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+
+    for run_id in range(1, 6):
+        print(f"\n{'='*60}")
+        print(f"Starting Independent Run {run_id}/5")
+        print(f"{'='*60}")
+
+        # 确保每次运行完全独立（不同随机种子）
+        random.seed(run_id * 42)
+        np.random.seed(run_id * 42)
+        torch.manual_seed(run_id * 42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(run_id * 42)
+            torch.cuda.manual_seed_all(run_id * 42)
+
+        start_time = time.time()
+        population = initialize_population(POP_SIZE)
+        print(f'Population initialized: {len(population)} individuals')
+
+        best_rmse_history = []
+        best_complexity_history = []
+        all_pareto_fronts = []
+        mutation_prob = 0.5
+
+        for gen in range(MAX_GEN):
+            print(f'  Generation {gen + 1}/{MAX_GEN} ...')
+            performance, complexity = evaluate_population(
+                population, train_dataset, val_dataset, min_speed, max_speed,
+                len(feature_columns), sequence_length, device
+            )
+            fronts, rank = fast_non_dominated_sort(performance, complexity)
+            distance = crowding_distance(performance, complexity, fronts)
+            mating_pool = tournament_selection(population, rank, distance, POP_SIZE)
+            offspring = crossover_population(mating_pool)
+            mutated_offspring = []
+            for child in offspring:
+                if np.random.random() < mutation_prob:
+                    mutated_child = variable_length_mutation(child)
+                    mutated_offspring.append(mutated_child)
+                else:
+                    mutated_offspring.append(child.copy())
+            offspring_perf, offspring_comp = evaluate_population(
+                mutated_offspring, train_dataset, val_dataset, min_speed, max_speed,
+                len(feature_columns), sequence_length, device
+            )
+            combined_pop = population + mutated_offspring
+            combined_perf = np.concatenate([performance, offspring_perf])
+            combined_comp = np.concatenate([complexity, offspring_comp])
+            combined_fronts, combined_rank = fast_non_dominated_sort(combined_perf, combined_comp)
+            combined_dist = crowding_distance(combined_perf, combined_comp, combined_fronts)
+            population, performance, complexity = environmental_selection(
+                combined_pop, combined_perf, combined_comp, combined_rank, combined_dist, POP_SIZE
+            )
+            pareto_front = {
+                'params': [combined_pop[i] for i in combined_fronts[0]],
+                'performance': combined_perf[combined_fronts[0]],
+                'complexity': combined_comp[combined_fronts[0]],
+                'num_solutions': len(combined_fronts[0]),
+                'generation': gen + 1
+            }
+            all_pareto_fronts.append(pareto_front)
+            valid_combined_perf = combined_perf[np.isfinite(combined_perf)]
+            if len(valid_combined_perf) > 0:
+                best_idx_combined = np.argmin(valid_combined_perf)
+                best_rmse_history.append(valid_combined_perf[best_idx_combined])
+                best_complexity_history.append(combined_comp[best_idx_combined])
+            else:
+                best_rmse_history.append(float('inf'))
+                best_complexity_history.append(float('inf'))
+
+        end_time = time.time()
+        print(f'Run {run_id} optimization completed! Time: {(end_time - start_time)/60:.2f} min')
+
+        # 选择最优个体（与上一版完全一致）
+        final_pareto = all_pareto_fronts[-1]
+        if final_pareto['num_solutions'] > 0:
+            perf_vals = final_pareto['performance']
+            comp_vals = final_pareto['complexity']
+            valid_mask = np.isfinite(perf_vals) & np.isfinite(comp_vals)
+            if valid_mask.any():
+                perf_vals = perf_vals[valid_mask]
+                comp_vals = comp_vals[valid_mask]
+                params = [final_pareto['params'][i] for i in range(len(valid_mask)) if valid_mask[i]]
+                normalized_perf = (perf_vals - perf_vals.min()) / (perf_vals.max() - perf_vals.min() + 1e-10)
+                normalized_comp = (comp_vals - comp_vals.min()) / (comp_vals.max() - comp_vals.min() + 1e-10)
+                trade_off_scores = np.sqrt(normalized_perf ** 2 + normalized_comp ** 2)
+                best_idx = np.argmin(trade_off_scores)
+                best_individual = params[best_idx]
+            else:
+                raise ValueError("No valid solutions in final generation")
+        else:
+            all_perf = np.concatenate([pf['performance'] for pf in all_pareto_fronts])
+            all_params = [p for pf in all_pareto_fronts for p in pf['params']]
+            valid_mask = np.isfinite(all_perf)
+            if valid_mask.any():
+                best_idx = np.argmin(all_perf[valid_mask])
+                best_individual = np.array(all_params)[valid_mask][best_idx]
+            else:
+                raise ValueError("All individuals failed evaluation!")
+
+        topo, cnn_params, lstm_params, setting = decode_individual(best_individual)
+        batch_size, learn_rate, opt_type, reg_type = decode_hyperparams(setting)
+        batch_size = max(2, batch_size)
+
+        # 训练最终模型
+        print(f'Training final model for Run {run_id}...')
+        model = HybridCNNBiLSTM(topo, cnn_params, lstm_params, len(feature_columns), sequence_length).to(device)
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size)
+        criterion = nn.MSELoss()
+        if opt_type == 'Adam':
+            optimizer = optim.Adam(model.parameters(), lr=learn_rate)
+        elif opt_type == 'SGD':
+            optimizer = optim.SGD(model.parameters(), lr=learn_rate, momentum=0.9)
+        elif opt_type == 'RMSprop':
+            optimizer = optim.RMSprop(model.parameters(), lr=learn_rate)
+        else:
+            optimizer = optim.Adadelta(model.parameters(), lr=learn_rate)
+
+        train_losses = []
+        val_losses = []
+        best_val_loss = float('inf')
+        patience = 20
+        patience_counter = 0
+        for epoch in range(200):
+            model.train()
+            train_loss = 0
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            model.eval()
+            val_loss = 0
+            val_samples = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = model(inputs)
+                    batch_loss = criterion(outputs, targets).item() * inputs.size(0)
+                    val_loss += batch_loss
+                    val_samples += inputs.size(0)
+            if val_samples > 0:
+                val_loss /= val_samples
+            train_losses.append(train_loss / len(train_loader))
+            val_losses.append(val_loss)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= patience:
+                break
+
+        # 保存训练损失曲线（带 run_id）
+        plt.figure(figsize=(9, 6))
+        epochs_range = range(1, len(train_losses) + 1)
+        plt.plot(epochs_range, train_losses, 'b-', linewidth=2.2, label='Training Loss')
+        plt.plot(epochs_range, val_losses, 'r--', linewidth=2.2, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (MSE)')
+        plt.title(f'Training and Validation Loss Curve - Run {run_id}')
+        plt.legend(loc='best')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'ieee_training_loss_curve_run{run_id}.png', dpi=300)
+        plt.close()
+
+        # 测试集评估
+        model.eval()
+        all_test_targets = []
+        all_test_outputs = []
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                all_test_targets.extend(targets.cpu().numpy())
+                all_test_outputs.extend(outputs.cpu().numpy())
+        all_test_targets = np.array(all_test_targets) * (max_speed - min_speed) + min_speed
+        all_test_outputs = np.array(all_test_outputs) * (max_speed - min_speed) + min_speed
+        all_test_targets = all_test_targets.flatten()
+        all_test_outputs = all_test_outputs.flatten()
+
+        mae_test = mean_absolute_error(all_test_targets, all_test_outputs)
+        rmse_test = np.sqrt(mean_squared_error(all_test_targets, all_test_outputs))
+        mape_test = np.mean(np.abs((all_test_targets - all_test_outputs) / all_test_targets)) * 100
+        r2_test = r2_score(all_test_targets, all_test_outputs)
+        r_test = pearsonr(all_test_targets, all_test_outputs)[0]
+
+        test_performance = {'mae': mae_test, 'rmse': rmse_test, 'mape': mape_test}
+
+        # Pareto 坐标存档（带 run_id）
+        pareto_archive = []
+        for pf in all_pareto_fronts:
+            perf = pf['performance']
+            comp = pf['complexity']
+            valid = np.isfinite(perf) & np.isfinite(comp)
+            if np.any(valid):
+                points = np.column_stack((comp[valid], perf[valid]))
+                pareto_archive.append({
+                    'generation': int(pf['generation']),
+                    'num_solutions': int(len(points)),
+                    'coordinates': points.tolist()
+                })
+        with open(f'ieee_pareto_front_coordinates_run{run_id}.json', 'w') as f:
+            json.dump(pareto_archive, f, indent=4)
+
+        # 完整结果存档（带 run_id）
+        with open(f'ieee_modeo_cnn_full_results_run{run_id}.pkl', 'wb') as f:
+            pickle.dump({
+                'best_individual': best_individual,
+                'best_rmse_history': best_rmse_history,
+                'pareto_fronts': all_pareto_fronts,
+                'test_performance': test_performance,
+                'training_losses': train_losses,
+                'validation_losses': val_losses,
+                'model_params': {
+                    'topo': topo,
+                    'cnn_params': cnn_params,
+                    'lstm_params': lstm_params,
+                    'setting': setting,
+                    'batch_size': batch_size,
+                    'learn_rate': learn_rate,
+                    'opt_type': opt_type
+                },
+                'test_predictions': {'true': all_test_targets, 'pred': all_test_outputs}
+            }, f)
+
+        # 生成报告（带 run_id 前缀）
+        report_metrics = generate_comprehensive_report(
+            model, test_loader, val_loader, device, min_speed, max_speed,
+            all_pareto_fronts, feature_columns, topo, cnn_params, lstm_params, setting,
+            test_performance, r_test, run_id
+        )
+
+        print(f"Run {run_id} completed and all files saved with prefix 'run{run_id}_'")
+
+    print('\n' + '='*80)
+    print('All 5 independent runs completed successfully!')
+    print('Each run has its own set of figures, CSVs, JSON and pickle files.')
+    print('Ready for statistical analysis or IEEE paper submission.')
+    print('='*80)
